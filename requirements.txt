@@ -1,0 +1,7 @@
+spotipy
+yandex-music
+aiogram
+apscheduler
+python-dotenv
+fuzzywuzzy
+python-Levenshtein

@@ -1,0 +1,6 @@
+.env
+.cache*
+manifest.json
+sync.log*
+.venv/
+__pycache__/
