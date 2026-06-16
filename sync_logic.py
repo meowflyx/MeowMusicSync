@@ -1,9 +1,16 @@
+"""Module for music synchronization logic between Yandex Music and Spotify.
+
+Uses an SQLite database for reliable, transaction-safe storage of track caches,
+failed attempts, pending approvals, and cross-platform track ID mappings.
+"""
+
 import logging
 import json
 import os
 import re
 import unicodedata
 import time
+import sqlite3
 from yandex_music import Client
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
@@ -13,10 +20,8 @@ from config import (
     YANDEX_MUSIC_TOKEN
 )
 
-MANIFEST_FILE = "manifest.json"
+DB_FILE = "sync_data.db"
 
-# Spotify хранит русских артистов латиницей, а Яндекс кириллицей.
-# Без этой таблицы мы НИКОГДА не найдем Короля и Шута по запросу "Korol i Shut"
 TRANSLIT_MAP = {
     "korol i shut": "Король и Шут",
     "sektor gaza": "Сектор Газа",
@@ -54,13 +59,11 @@ TRANSLIT_MAP = {
     "lumen": "Lumen",
     "slot": "Слот",
     "aria": "Ария",
-    "korol i shut": "Король и Шут",
     "piknik": "Пикник",
     "chizh": "Чиж",
     "chizh & co": "Чиж & Co",
     "lyapis trubetskoy": "Ляпис Трубецкой",
     "grazhdanskaya oborona": "Гражданская Оборона",
-    "korol i shut": "Король и Шут",
     "sansara": "Сансара",
     "nervy": "Нервы",
     "noize mc": "Noize MC",
@@ -81,8 +84,6 @@ TRANSLIT_MAP = {
     "viktor tsoi": "Виктор Цой",
 }
 
-# Посимвольная транслитерация латиница -> кириллица (фолбэк)
-# Порядок важен: многобуквенные сочетания первыми
 LATIN_TO_CYRILLIC = [
     ("shch", "щ"), ("sch", "щ"),
     ("zh", "ж"), ("ch", "ч"), ("sh", "ш"),
@@ -96,17 +97,6 @@ LATIN_TO_CYRILLIC = [
     ("y", "ы"), ("x", "кс"),
     ("'", "ь"), ("\'", "ь"),
 ]
-
-def translit_to_cyrillic(text):
-    if any(ord(c) > 127 for c in text):
-        return text
-    result = text.lower()
-    for lat, cyr in LATIN_TO_CYRILLIC:
-        result = result.replace(lat, cyr)
-    return result
-
-def has_latin(text):
-    return any('a' <= c.lower() <= 'z' for c in text)
 
 REMASTER_PATTERN = re.compile(
     r'\s*[-–—]\s*'
@@ -133,26 +123,216 @@ SUFFIX_PATTERN = re.compile(
 SCORE_AUTO_ACCEPT = 93
 SCORE_PENDING = 70
 
-def load_manifest():
-    if os.path.exists(MANIFEST_FILE):
-        with open(MANIFEST_FILE, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-            for key in ["failed", "pending"]:
-                if key not in data:
-                    data[key] = {}
-            return data
-    return {"yandex": {}, "spotify": {}, "failed": {}, "pending": {}}
 
-def save_manifest(manifest):
-    with open(MANIFEST_FILE, 'w', encoding='utf-8') as f:
-        json.dump(manifest, f, ensure_ascii=False, indent=2)
+def init_db():
+    """Initialize SQLite database tables and automatically migrate data from manifest.json if present."""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS yandex_cache (
+            id TEXT PRIMARY KEY,
+            artists TEXT,
+            title TEXT,
+            query TEXT
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS spotify_cache (
+            id TEXT PRIMARY KEY,
+            artists TEXT,
+            title TEXT,
+            query TEXT
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS failed_syncs (
+            key TEXT PRIMARY KEY,
+            query TEXT
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS pending_syncs (
+            key TEXT PRIMARY KEY,
+            direction TEXT,
+            source TEXT,
+            found TEXT,
+            found_id TEXT,
+            score INTEGER
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS mappings (
+            ym_id TEXT UNIQUE,
+            sp_id TEXT UNIQUE
+        )
+    """)
+    conn.commit()
+    
+    if os.path.exists("manifest.json"):
+        logging.info("Обнаружен старый файл manifest.json. Начинаю миграцию в SQLite...")
+        try:
+            with open("manifest.json", "r", encoding="utf-8") as f:
+                data = json.load(f)
+                
+            yandex = data.get("yandex", {})
+            for y_id, info in yandex.items():
+                if isinstance(info, str):
+                    artists, title = parse_query(info)
+                    query = info
+                else:
+                    artists = info.get("artists", "")
+                    title = info.get("title", "")
+                    query = info.get("query", "")
+                cursor.execute(
+                    "INSERT OR IGNORE INTO yandex_cache (id, artists, title, query) VALUES (?, ?, ?, ?)",
+                    (str(y_id), artists, title, query)
+                )
+                
+            spotify = data.get("spotify", {})
+            for s_id, info in spotify.items():
+                if isinstance(info, str):
+                    artists, title = parse_query(info)
+                    query = info
+                else:
+                    artists = info.get("artists", "")
+                    title = info.get("title", "")
+                    query = info.get("query", "")
+                cursor.execute(
+                    "INSERT OR IGNORE INTO spotify_cache (id, artists, title, query) VALUES (?, ?, ?, ?)",
+                    (str(s_id), artists, title, query)
+                )
+                
+            failed = data.get("failed", {})
+            for key, query in failed.items():
+                cursor.execute(
+                    "INSERT OR IGNORE INTO failed_syncs (key, query) VALUES (?, ?)",
+                    (str(key), query)
+                )
+                
+            pending = data.get("pending", {})
+            for key, entry in pending.items():
+                cursor.execute(
+                    "INSERT OR IGNORE INTO pending_syncs (key, direction, source, found, found_id, score) VALUES (?, ?, ?, ?, ?, ?)",
+                    (str(key), entry.get("direction", ""), entry.get("source", ""), entry.get("found", ""), entry.get("found_id", ""), entry.get("score", 0))
+                )
+                
+            mappings = data.get("mappings", {})
+            ym_to_sp = mappings.get("ym_to_sp", {})
+            for ym_id, sp_id in ym_to_sp.items():
+                cursor.execute(
+                    "INSERT OR IGNORE INTO mappings (ym_id, sp_id) VALUES (?, ?)",
+                    (str(ym_id), str(sp_id))
+                )
+            
+            conn.commit()
+            logging.info("Миграция в SQLite успешно завершена.")
+            os.rename("manifest.json", "manifest.json.bak")
+            logging.info("Файл manifest.json переименован в manifest.json.bak")
+        except Exception as e:
+            logging.error(f"Ошибка при миграции манифеста в SQLite: {e}")
+            
+    conn.close()
+
+
+def get_status_stats():
+    """Retrieve statistics from the SQLite database."""
+    init_db()
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT COUNT(*) FROM yandex_cache")
+    yandex_count = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM spotify_cache")
+    spotify_count = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM mappings")
+    mappings_count = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM pending_syncs")
+    pending_count = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM failed_syncs")
+    failed_count = cursor.fetchone()[0]
+    
+    conn.close()
+    return {
+        "yandex": yandex_count,
+        "spotify": spotify_count,
+        "mappings": mappings_count,
+        "pending": pending_count,
+        "failed": failed_count
+    }
+
+
+def get_pending_tracks():
+    """Retrieve all pending review items from the database."""
+    init_db()
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT key, direction, source, found, found_id, score FROM pending_syncs")
+    rows = cursor.fetchall()
+    conn.close()
+    return {
+        r[0]: {
+            "direction": r[1],
+            "source": r[2],
+            "found": r[3],
+            "found_id": r[4],
+            "score": r[5]
+        } for r in rows
+    }
+
+
+def clear_failed_tracks():
+    """Delete all records from failed_syncs table and return the count of deleted items."""
+    init_db()
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM failed_syncs")
+    count = cursor.fetchone()[0]
+    cursor.execute("DELETE FROM failed_syncs")
+    conn.commit()
+    conn.close()
+    return count
+
+
+def get_failed_tracks():
+    """Retrieve all failed tracks from the database."""
+    init_db()
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT key, query FROM failed_syncs")
+    rows = cursor.fetchall()
+    conn.close()
+    return {r[0]: r[1] for r in rows}
+
+
+def translit_to_cyrillic(text):
+    """Perform character-by-character Latin to Cyrillic transliteration fallback."""
+    if any(ord(c) > 127 for c in text):
+        return text
+    result = text.lower()
+    for lat, cyr in LATIN_TO_CYRILLIC:
+        result = result.replace(lat, cyr)
+    return result
+
+
+def has_latin(text):
+    """Check if the text contains any latin characters."""
+    return any('a' <= c.lower() <= 'z' for c in text)
+
 
 def get_ym_client():
+    """Initialize and return the Yandex Music API client."""
     if not YANDEX_MUSIC_TOKEN:
         return None
     return Client(YANDEX_MUSIC_TOKEN).init()
 
+
 def get_sp_client():
+    """Initialize and return the Spotify API client using OAuth."""
     if not SPOTIPY_CLIENT_ID or not SPOTIPY_CLIENT_SECRET or not SPOTIPY_REDIRECT_URI:
         return None
     auth_manager = SpotifyOAuth(
@@ -164,21 +344,27 @@ def get_sp_client():
     )
     return spotipy.Spotify(auth_manager=auth_manager)
 
+
 def clean_title(title):
+    """Remove remaster, features, and other auxiliary suffixes from track titles."""
     title = REMASTER_PATTERN.sub('', title)
     title = FEAT_PATTERN.sub('', title)
     title = SUFFIX_PATTERN.sub('', title)
     title = title.strip(' -–—')
     return title
 
+
 def normalize(text):
+    """Normalize string case, remove accents/diacritics, and strip punctuation."""
     text = text.lower().strip()
     text = unicodedata.normalize('NFKD', text)
     text = re.sub(r'[^\w\s]', ' ', text)
     text = re.sub(r'\s+', ' ', text)
     return text.strip()
 
+
 def translate_artist(artist_name):
+    """Translate latinized Russian artist name to Cyrillic using maps or transliteration."""
     key = artist_name.lower().strip()
     if key in TRANSLIT_MAP:
         return TRANSLIT_MAP[key]
@@ -186,37 +372,30 @@ def translate_artist(artist_name):
         return translit_to_cyrillic(artist_name)
     return artist_name
 
+
 def build_search_queries(artists_str, title):
+    """Build a prioritized list of fallback search queries based on variations of artist translation."""
     clean = clean_title(title)
-    
     artists_list = [a.strip() for a in artists_str.split(',')]
     
-    # Сначала пробуем таблицу известных артистов
     map_translated = [TRANSLIT_MAP.get(a.lower().strip(), a) for a in artists_list]
     map_str = ", ".join(map_translated)
     
-    # Потом посимвольную транслитерацию
     char_translated = [translit_to_cyrillic(a) if has_latin(a) else a for a in artists_list]
     char_str = ", ".join(char_translated)
     
     queries = []
     
-    # Попытка 1: артисты из таблицы + чистое название
     queries.append(f"{map_str} {clean}")
-    
-    # Попытка 2: только первый артист (таблица) + название
     queries.append(f"{map_translated[0]} {clean}")
     
-    # Попытка 3: посимвольная транслитерация + название
     if char_str.lower() != map_str.lower():
         queries.append(f"{char_str} {clean}")
         queries.append(f"{char_translated[0]} {clean}")
     
-    # Попытка 4: оригинальные артисты (латиница) + чистое название
     if artists_str.lower() != map_str.lower():
         queries.append(f"{artists_str} {clean}")
     
-    # Попытка 5: только название
     if len(clean) > 3:
         queries.append(clean)
     
@@ -230,7 +409,9 @@ def build_search_queries(artists_str, title):
     
     return unique
 
+
 def score_match(query_artists, query_title, result_artists, result_title):
+    """Calculate similarity score between search query details and search result metadata."""
     q_title_clean = normalize(clean_title(query_title))
     r_title_clean = normalize(clean_title(result_title))
     
@@ -238,7 +419,6 @@ def score_match(query_artists, query_title, result_artists, result_title):
     title_sort = fuzz.token_sort_ratio(q_title_clean, r_title_clean)
     title_score = max(title_ratio, title_sort)
     
-    # Сравниваем артистов в нескольких формах и берём лучший результат
     q_artists_raw = [a.strip() for a in query_artists.split(',')]
     r_artists_raw = [a.strip() for a in result_artists.split(',')]
     
@@ -279,14 +459,15 @@ def score_match(query_artists, query_title, result_artists, result_title):
     if artist_score < 50 and title_score > 80:
         penalty += 20
 
-    # Тот же артист но title не идеально = скорее всего другой трек
     if title_score < 85 and artist_score >= 80:
         penalty += 15
     
     final = (title_score * 0.6) + (artist_score * 0.4) - penalty
     return max(0, final)
 
+
 def match_track_spotify(query_artists, query_title, sp_client):
+    """Search for the track on Spotify and return the best match track ID, clean name, and score."""
     queries = build_search_queries(query_artists, query_title)
     
     best_match = None
@@ -297,7 +478,7 @@ def match_track_spotify(query_artists, query_title, sp_client):
         try:
             results = sp_client.search(q=q, limit=5, type='track')
         except Exception:
-            time.sleep(1)
+            time.sleep(5)
             continue
         if not results['tracks']['items']:
             continue
@@ -311,16 +492,17 @@ def match_track_spotify(query_artists, query_title, sp_client):
                 best_match = t['id']
                 best_name = f"{artists} {title}"
         
-        # Если нашли отличное совпадение, не делаем лишних запросов
         if best_score >= SCORE_AUTO_ACCEPT:
             break
-        time.sleep(0.15)
+        time.sleep(1.5)
     
     if best_score >= SCORE_PENDING:
         return best_match, best_name, best_score
     return None, None, best_score
 
+
 def match_track_yandex(query_artists, query_title, ym_client):
+    """Search for the track on Yandex Music and return the best match track ID, clean name, and score."""
     queries = build_search_queries(query_artists, query_title)
     
     best_match = None
@@ -331,7 +513,7 @@ def match_track_yandex(query_artists, query_title, ym_client):
         try:
             results = ym_client.search(q, type_='track')
         except Exception:
-            time.sleep(1)
+            time.sleep(5)
             continue
         if not results.tracks or not results.tracks.results:
             continue
@@ -347,42 +529,44 @@ def match_track_yandex(query_artists, query_title, ym_client):
         
         if best_score >= SCORE_AUTO_ACCEPT:
             break
-        time.sleep(0.15)
+        time.sleep(1.5)
     
     if best_score >= SCORE_PENDING:
         return best_match, best_name, best_score
     return None, None, best_score
 
+
 def parse_query(search_query):
+    """Parse a search query string into simple (artist, title) fallback parts."""
     parts = search_query.split(' ', 1)
     if len(parts) == 2:
         return parts[0], parts[1]
     return search_query, ""
 
-def get_ym_likes(ym_client, manifest):
+
+def get_ym_likes(ym_client):
+    """Retrieve all liked tracks from Yandex Music, utilizing and updating the database cache."""
     tracks_short = ym_client.users_likes_tracks().tracks
     if not tracks_short:
         return []
     
+    init_db()
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    
     res = []
     track_ids_to_fetch = []
-    track_id_map = {}
     
     for t in tracks_short:
         tid = str(t.id)
-        if tid in manifest["yandex"]:
-            entry = manifest["yandex"][tid]
-            if isinstance(entry, str):
-                # Старый формат, мигрируем
-                artists, title = parse_query(entry)
-                manifest["yandex"][tid] = {"artists": artists, "title": title, "query": entry}
-                entry = manifest["yandex"][tid]
-            res.append({"id": tid, "artists": entry.get("artists", ""), "title": entry.get("title", ""), "search_query": entry.get("query", "")})
+        cursor.execute("SELECT artists, title, query FROM yandex_cache WHERE id = ?", (tid,))
+        row = cursor.fetchone()
+        if row:
+            res.append({"id": tid, "artists": row[0], "title": row[1], "search_query": row[2]})
         else:
             fetch_id = f"{t.id}:{t.album_id}" if t.album_id else str(t.id)
             track_ids_to_fetch.append(fetch_id)
-            track_id_map[fetch_id] = tid
-    
+            
     if track_ids_to_fetch:
         full_tracks = []
         for i in range(0, len(track_ids_to_fetch), 50):
@@ -394,54 +578,60 @@ def get_ym_likes(ym_client, manifest):
                 continue
         
         for t in full_tracks:
-            if not t: continue
+            if not t:
+                continue
             artists = ", ".join([a.name for a in t.artists]) if t.artists else "Unknown"
             title = t.title or ""
             query = f"{artists} {title}"
             tid = str(t.id)
-            manifest["yandex"][tid] = {"artists": artists, "title": title, "query": query}
+            cursor.execute("INSERT OR REPLACE INTO yandex_cache (id, artists, title, query) VALUES (?, ?, ?, ?)", (tid, artists, title, query))
             res.append({"id": tid, "artists": artists, "title": title, "search_query": query})
             
-        save_manifest(manifest)
+        conn.commit()
+    conn.close()
     return res
 
-def get_sp_likes(sp_client, manifest):
+
+def get_sp_likes(sp_client):
+    """Retrieve all saved tracks from Spotify, utilizing and updating the database cache."""
+    init_db()
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    
     res = []
     results = sp_client.current_user_saved_tracks(limit=50)
-    new_tracks_found = False
     
     while results:
+        new_tracks = []
         for item in results['items']:
             track = item['track']
             tid = track['id']
-            if tid in manifest["spotify"]:
-                entry = manifest["spotify"][tid]
-                if isinstance(entry, str):
-                    artists_list = [a['name'] for a in track['artists']]
-                    artists = ", ".join(artists_list)
-                    title = track['name']
-                    manifest["spotify"][tid] = {"artists": artists, "title": title, "query": entry}
-                    entry = manifest["spotify"][tid]
-                    new_tracks_found = True
-                res.append({"id": tid, "artists": entry.get("artists", ""), "title": entry.get("title", ""), "search_query": entry.get("query", "")})
+            cursor.execute("SELECT artists, title, query FROM spotify_cache WHERE id = ?", (tid,))
+            row = cursor.fetchone()
+            if row:
+                res.append({"id": tid, "artists": row[0], "title": row[1], "search_query": row[2]})
             else:
                 artists = ", ".join([a['name'] for a in track['artists']])
                 title = track['name']
                 query = f"{artists} {title}"
-                manifest["spotify"][tid] = {"artists": artists, "title": title, "query": query}
+                new_tracks.append((tid, artists, title, query))
                 res.append({"id": tid, "artists": artists, "title": title, "search_query": query})
-                new_tracks_found = True
                 
+        if new_tracks:
+            cursor.executemany("INSERT OR REPLACE INTO spotify_cache (id, artists, title, query) VALUES (?, ?, ?, ?)", new_tracks)
+            conn.commit()
+            
         if results['next']:
             results = sp_client.next(results)
         else:
             break
             
-    if new_tracks_found:
-        save_manifest(manifest)
+    conn.close()
     return res
 
+
 def is_already_present(track_artists, track_title, existing_tracks):
+    """Check via fuzzy match if the track matches any entry in the existing tracks list."""
     q_title = normalize(clean_title(track_title))
     q_artists = [normalize(translate_artist(a.strip())) for a in track_artists.split(',')]
     q_main = q_artists[0] if q_artists else ""
@@ -458,169 +648,302 @@ def is_already_present(track_artists, track_title, existing_tracks):
             return True
     return False
 
+
 def sync_ym_to_sp(log_callback=None, pending_callback=None):
+    """Synchronize liked tracks from Yandex Music to Spotify, preventing duplicates."""
     ym_client = get_ym_client()
     sp_client = get_sp_client()
     if not ym_client or not sp_client:
         return "Клиенты не настроены"
 
-    manifest = load_manifest()
-    ym_likes = get_ym_likes(ym_client, manifest)
-    sp_likes = get_sp_likes(sp_client, manifest)
+    ym_likes = get_ym_likes(ym_client)
+    sp_likes = get_sp_likes(sp_client)
+    
+    sp_liked_ids = {str(ex['id']) for ex in sp_likes}
     
     added = 0
-    failed = []
+    failed_count = 0
     pending_count = 0
     skipped = 0
     
+    init_db()
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    
     for ym_track in ym_likes:
+        ym_id = str(ym_track['id'])
         artists = ym_track.get('artists', '')
         title = ym_track.get('title', '')
         query = ym_track.get('search_query', '')
         
-        fail_key = f"ym_to_sp:{ym_track['id']}"
+        fail_key = f"ym_to_sp:{ym_id}"
         pend_key = fail_key
         
-        if fail_key in manifest["failed"] or pend_key in manifest["pending"]:
+        cursor.execute("SELECT 1 FROM failed_syncs WHERE key = ?", (fail_key,))
+        is_fail = cursor.fetchone() is not None
+        cursor.execute("SELECT 1 FROM pending_syncs WHERE key = ?", (pend_key,))
+        is_pend = cursor.fetchone() is not None
+        
+        if is_fail or is_pend:
             skipped += 1
             continue
+            
+        cursor.execute("SELECT sp_id FROM mappings WHERE ym_id = ?", (ym_id,))
+        row = cursor.fetchone()
+        mapped_sp_id = row[0] if row else None
         
+        if mapped_sp_id:
+            if mapped_sp_id in sp_liked_ids:
+                continue
+            try:
+                sp_client.current_user_saved_tracks_add(tracks=[mapped_sp_id])
+                sp_likes.append({"id": mapped_sp_id, "artists": artists, "title": title, "search_query": query})
+                sp_liked_ids.add(mapped_sp_id)
+                added += 1
+                logging.info(f"✅ [Маппинг] Добавлен в Spotify: '{query}' -> ID '{mapped_sp_id}'")
+            except Exception as e:
+                logging.error(f"Ошибка при добавлении мапированного трека в Spotify: {e}")
+            continue
+            
         if is_already_present(artists, title, sp_likes):
             continue
             
         sp_id, best_name, score = match_track_spotify(artists, title, sp_client)
-        if sp_id and score >= SCORE_AUTO_ACCEPT:
-            sp_client.current_user_saved_tracks_add(tracks=[sp_id])
-            manifest["spotify"][sp_id] = {"artists": artists, "title": title, "query": best_name}
-            sp_likes.append({"id": sp_id, "artists": artists, "title": title, "search_query": best_name})
-            logging.info(f"✅ [{score:.0f}%] Добавлен в Spotify: '{query}' -> как '{best_name}'")
-            added += 1
-        elif sp_id and score >= SCORE_PENDING:
-            manifest["pending"][pend_key] = {
-                "direction": "ym_to_sp",
-                "source": query,
-                "found": best_name,
-                "found_id": sp_id,
-                "score": round(score),
-            }
-            logging.info(f"⏳ [{score:.0f}%] Ожидает одобрения: '{query}' -> '{best_name}'")
-            pending_count += 1
-            if pending_callback:
-                pending_callback(pend_key, query, best_name, round(score), "ym_to_sp")
+        if sp_id:
+            if sp_id in sp_liked_ids:
+                cursor.execute("INSERT OR IGNORE INTO mappings (ym_id, sp_id) VALUES (?, ?)", (ym_id, sp_id))
+                conn.commit()
+                logging.info(f"ℹ️ [{score:.0f}%] Трек уже есть в Spotify по ID: '{query}' -> '{best_name}'")
+                continue
+                
+            if score >= SCORE_AUTO_ACCEPT:
+                try:
+                    sp_client.current_user_saved_tracks_add(tracks=[sp_id])
+                    cursor.execute("INSERT OR REPLACE INTO spotify_cache (id, artists, title, query) VALUES (?, ?, ?, ?)", (sp_id, artists, title, best_name))
+                    sp_likes.append({"id": sp_id, "artists": artists, "title": title, "search_query": best_name})
+                    sp_liked_ids.add(sp_id)
+                    
+                    cursor.execute("INSERT OR IGNORE INTO mappings (ym_id, sp_id) VALUES (?, ?)", (ym_id, sp_id))
+                    conn.commit()
+                    
+                    logging.info(f"✅ [{score:.0f}%] Добавлен в Spotify: '{query}' -> как '{best_name}'")
+                    added += 1
+                except Exception as e:
+                    logging.error(f"Ошибка при добавлении трека в Spotify: {e}")
+            elif score >= SCORE_PENDING:
+                cursor.execute(
+                    "INSERT OR REPLACE INTO pending_syncs (key, direction, source, found, found_id, score) VALUES (?, ?, ?, ?, ?, ?)",
+                    (pend_key, "ym_to_sp", query, best_name, sp_id, round(score))
+                )
+                conn.commit()
+                logging.info(f"⏳ [{score:.0f}%] Ожидает одобрения: '{query}' -> '{best_name}'")
+                pending_count += 1
+                if pending_callback:
+                    pending_callback(pend_key, query, best_name, round(score), "ym_to_sp")
+            else:
+                logging.warning(f"❌ [{score:.0f}%] Не найден в Spotify: '{query}'")
+                cursor.execute("INSERT OR REPLACE INTO failed_syncs (key, query) VALUES (?, ?)", (fail_key, query))
+                conn.commit()
+                failed_count += 1
         else:
             logging.warning(f"❌ [{score:.0f}%] Не найден в Spotify: '{query}'")
-            manifest["failed"][fail_key] = query
-            failed.append(query)
-                
-    save_manifest(manifest)
-    msg = f"Яндекс → Spotify: добавлено {added}, на одобрении {pending_count}, не найдено {len(failed)}."
+            cursor.execute("INSERT OR REPLACE INTO failed_syncs (key, query) VALUES (?, ?)", (fail_key, query))
+            conn.commit()
+            failed_count += 1
+            
+    conn.close()
+    msg = f"Яндекс → Spotify: добавлено {added}, на одобрении {pending_count}, не найдено {failed_count}."
     if skipped:
         msg += f" Пропущено: {skipped}."
     return msg
 
+
 def sync_sp_to_ym(log_callback=None, pending_callback=None):
+    """Synchronize liked tracks from Spotify to Yandex Music, preventing duplicates."""
     ym_client = get_ym_client()
     sp_client = get_sp_client()
     if not ym_client or not sp_client:
         return "Клиенты не настроены"
 
-    manifest = load_manifest()
-    sp_likes = get_sp_likes(sp_client, manifest)
-    ym_likes = get_ym_likes(ym_client, manifest)
+    sp_likes = get_sp_likes(sp_client)
+    ym_likes = get_ym_likes(ym_client)
+    
+    ym_liked_ids = {str(ex['id']) for ex in ym_likes}
     
     added = 0
-    failed = []
+    failed_count = 0
     pending_count = 0
     skipped = 0
     
+    init_db()
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    
     for sp_track in sp_likes:
+        sp_id = str(sp_track['id'])
         artists = sp_track.get('artists', '')
         title = sp_track.get('title', '')
         query = sp_track.get('search_query', '')
         
-        fail_key = f"sp_to_ym:{sp_track['id']}"
+        fail_key = f"sp_to_ym:{sp_id}"
         pend_key = fail_key
         
-        if fail_key in manifest["failed"] or pend_key in manifest["pending"]:
+        cursor.execute("SELECT 1 FROM failed_syncs WHERE key = ?", (fail_key,))
+        is_fail = cursor.fetchone() is not None
+        cursor.execute("SELECT 1 FROM pending_syncs WHERE key = ?", (pend_key,))
+        is_pend = cursor.fetchone() is not None
+        
+        if is_fail or is_pend:
             skipped += 1
             continue
+            
+        cursor.execute("SELECT ym_id FROM mappings WHERE sp_id = ?", (sp_id,))
+        row = cursor.fetchone()
+        mapped_ym_id = row[0] if row else None
         
+        if mapped_ym_id:
+            mapped_ym_id = str(mapped_ym_id)
+            if mapped_ym_id in ym_liked_ids:
+                continue
+            try:
+                ym_client.users_likes_tracks_add(track_ids=[mapped_ym_id])
+                ym_likes.append({"id": mapped_ym_id, "artists": artists, "title": title, "search_query": query})
+                ym_liked_ids.add(mapped_ym_id)
+                added += 1
+                logging.info(f"✅ [Маппинг] Добавлен в Яндекс: '{query}' -> ID '{mapped_ym_id}'")
+            except Exception as e:
+                logging.error(f"Ошибка при добавлении мапированного трека в Яндекс Музыку: {e}")
+            continue
+            
         if is_already_present(artists, title, ym_likes):
             continue
             
         ym_id, best_name, score = match_track_yandex(artists, title, ym_client)
-        if ym_id and score >= SCORE_AUTO_ACCEPT:
-            ym_client.users_likes_tracks_add(track_ids=[ym_id])
-            manifest["yandex"][str(ym_id)] = {"artists": artists, "title": title, "query": best_name}
-            ym_likes.append({"id": str(ym_id), "artists": artists, "title": title, "search_query": best_name})
-            logging.info(f"✅ [{score:.0f}%] Добавлен в Яндекс: '{query}' -> как '{best_name}'")
-            added += 1
-        elif ym_id and score >= SCORE_PENDING:
-            manifest["pending"][pend_key] = {
-                "direction": "sp_to_ym",
-                "source": query,
-                "found": best_name,
-                "found_id": str(ym_id),
-                "score": round(score),
-            }
-            logging.info(f"⏳ [{score:.0f}%] Ожидает одобрения: '{query}' -> '{best_name}'")
-            pending_count += 1
-            if pending_callback:
-                pending_callback(pend_key, query, best_name, round(score), "sp_to_ym")
+        if ym_id:
+            ym_id = str(ym_id)
+            if ym_id in ym_liked_ids:
+                cursor.execute("INSERT OR IGNORE INTO mappings (ym_id, sp_id) VALUES (?, ?)", (ym_id, sp_id))
+                conn.commit()
+                logging.info(f"ℹ️ [{score:.0f}%] Трек уже есть в Яндекс по ID: '{query}' -> '{best_name}'")
+                continue
+                
+            if score >= SCORE_AUTO_ACCEPT:
+                try:
+                    ym_client.users_likes_tracks_add(track_ids=[ym_id])
+                    cursor.execute("INSERT OR REPLACE INTO yandex_cache (id, artists, title, query) VALUES (?, ?, ?, ?)", (ym_id, artists, title, best_name))
+                    ym_likes.append({"id": ym_id, "artists": artists, "title": title, "search_query": best_name})
+                    ym_liked_ids.add(ym_id)
+                    
+                    cursor.execute("INSERT OR IGNORE INTO mappings (ym_id, sp_id) VALUES (?, ?)", (ym_id, sp_id))
+                    conn.commit()
+                    
+                    logging.info(f"✅ [{score:.0f}%] Добавлен в Яндекс: '{query}' -> как '{best_name}'")
+                    added += 1
+                except Exception as e:
+                    logging.error(f"Ошибка при добавлении трека в Яндекс Музыку: {e}")
+            elif score >= SCORE_PENDING:
+                cursor.execute(
+                    "INSERT OR REPLACE INTO pending_syncs (key, direction, source, found, found_id, score) VALUES (?, ?, ?, ?, ?, ?)",
+                    (pend_key, "sp_to_ym", query, best_name, ym_id, round(score))
+                )
+                conn.commit()
+                logging.info(f"⏳ [{score:.0f}%] Ожидает одобрения: '{query}' -> '{best_name}'")
+                pending_count += 1
+                if pending_callback:
+                    pending_callback(pend_key, query, best_name, round(score), "sp_to_ym")
+            else:
+                logging.warning(f"❌ [{score:.0f}%] Не найден в Яндексе: '{query}'")
+                cursor.execute("INSERT OR REPLACE INTO failed_syncs (key, query) VALUES (?, ?)", (fail_key, query))
+                conn.commit()
+                failed_count += 1
         else:
             logging.warning(f"❌ [{score:.0f}%] Не найден в Яндексе: '{query}'")
-            manifest["failed"][fail_key] = query
-            failed.append(query)
-
-    save_manifest(manifest)
-    msg = f"Spotify → Яндекс: добавлено {added}, на одобрении {pending_count}, не найдено {len(failed)}."
+            cursor.execute("INSERT OR REPLACE INTO failed_syncs (key, query) VALUES (?, ?)", (fail_key, query))
+            conn.commit()
+            failed_count += 1
+            
+    conn.close()
+    msg = f"Spotify → Яндекс: добавлено {added}, на одобрении {pending_count}, не найдено {failed_count}."
     if skipped:
         msg += f" Пропущено: {skipped}."
     return msg
 
+
 def approve_pending(pend_key):
-    manifest = load_manifest()
-    if pend_key not in manifest["pending"]:
-        return False, "Трек не найден в ожидающих"
+    """Approve a pending track match, add it to likes, add mapping, and delete from pending."""
+    init_db()
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
     
-    entry = manifest["pending"][pend_key]
-    direction = entry["direction"]
-    found_id = entry["found_id"]
-    found_name = entry["found"]
-    source_name = entry["source"]
+    cursor.execute("SELECT direction, found_id, found, source FROM pending_syncs WHERE key = ?", (pend_key,))
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        return False, "Трек не найден в ожидающих"
+        
+    direction, found_id, found_name, source_name = row
+    
+    parts = pend_key.split(":", 1)
+    source_id = parts[1] if len(parts) == 2 else None
     
     if direction == "sp_to_ym":
         ym_client = get_ym_client()
         if not ym_client:
+            conn.close()
             return False, "Яндекс клиент не настроен"
-        ym_client.users_likes_tracks_add(track_ids=[found_id])
-        manifest["yandex"][found_id] = {"artists": "", "title": "", "query": found_name}
-        logging.info(f"✅ Одобрен: '{source_name}' -> '{found_name}'")
+        try:
+            ym_client.users_likes_tracks_add(track_ids=[found_id])
+            cursor.execute("INSERT OR REPLACE INTO yandex_cache (id, artists, title, query) VALUES (?, ?, ?, ?)", (found_id, "", "", found_name))
+            if source_id:
+                cursor.execute("INSERT OR IGNORE INTO mappings (ym_id, sp_id) VALUES (?, ?)", (found_id, source_id))
+            logging.info(f"✅ Одобрен: '{source_name}' -> '{found_name}'")
+        except Exception as e:
+            conn.close()
+            return False, f"Ошибка при добавлении в Яндекс: {e}"
     elif direction == "ym_to_sp":
         sp_client = get_sp_client()
         if not sp_client:
+            conn.close()
             return False, "Spotify клиент не настроен"
-        sp_client.current_user_saved_tracks_add(tracks=[found_id])
-        manifest["spotify"][found_id] = {"artists": "", "title": "", "query": found_name}
-        logging.info(f"✅ Одобрен: '{source_name}' -> '{found_name}'")
-    
-    del manifest["pending"][pend_key]
-    save_manifest(manifest)
+        try:
+            sp_client.current_user_saved_tracks_add(tracks=[found_id])
+            cursor.execute("INSERT OR REPLACE INTO spotify_cache (id, artists, title, query) VALUES (?, ?, ?, ?)", (found_id, "", "", found_name))
+            if source_id:
+                cursor.execute("INSERT OR IGNORE INTO mappings (ym_id, sp_id) VALUES (?, ?)", (source_id, found_id))
+            logging.info(f"✅ Одобрен: '{source_name}' -> '{found_name}'")
+        except Exception as e:
+            conn.close()
+            return False, f"Ошибка при добавлении в Spotify: {e}"
+            
+    cursor.execute("DELETE FROM pending_syncs WHERE key = ?", (pend_key,))
+    conn.commit()
+    conn.close()
     return True, f"Добавлен: {found_name}"
 
+
 def reject_pending(pend_key):
-    manifest = load_manifest()
-    if pend_key not in manifest["pending"]:
-        return False, "Трек не найден в ожидающих"
+    """Reject a pending track match and move it to failed_syncs."""
+    init_db()
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
     
-    entry = manifest["pending"][pend_key]
-    manifest["failed"][pend_key] = entry["source"]
-    del manifest["pending"][pend_key]
-    save_manifest(manifest)
-    logging.info(f"❌ Отклонён: '{entry['source']}'")
-    return True, f"Отклонён: {entry['source']}"
+    cursor.execute("SELECT source FROM pending_syncs WHERE key = ?", (pend_key,))
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        return False, "Трек не найден в ожидающих"
+        
+    source_name = row[0]
+    cursor.execute("INSERT OR REPLACE INTO failed_syncs (key, query) VALUES (?, ?)", (pend_key, source_name))
+    cursor.execute("DELETE FROM pending_syncs WHERE key = ?", (pend_key,))
+    conn.commit()
+    conn.close()
+    logging.info(f"❌ Отклонён: '{source_name}'")
+    return True, f"Отклонён: {source_name}"
+
 
 def full_two_way_sync(log_callback=None, pending_callback=None):
+    """Execute complete two-way synchronization between Yandex Music and Spotify."""
     res1 = sync_ym_to_sp(log_callback, pending_callback)
     res2 = sync_sp_to_ym(log_callback, pending_callback)
     return f"{res1}\n{res2}"
