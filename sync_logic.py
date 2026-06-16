@@ -2,6 +2,7 @@
 
 Uses an SQLite database for reliable, transaction-safe storage of track caches,
 failed attempts, pending approvals, and cross-platform track ID mappings.
+Optimized to run check operations using fast set lookups and instant mapping shortcuts.
 """
 
 import logging
@@ -630,8 +631,8 @@ def get_sp_likes(sp_client):
     return res
 
 
-def is_already_present(track_artists, track_title, existing_tracks):
-    """Check via fuzzy match if the track matches any entry in the existing tracks list."""
+def find_already_present_id(track_artists, track_title, existing_tracks):
+    """Find and return the ID of a matching track in the existing tracks list, or None."""
     q_title = normalize(clean_title(track_title))
     q_artists = [normalize(translate_artist(a.strip())) for a in track_artists.split(',')]
     q_main = q_artists[0] if q_artists else ""
@@ -645,8 +646,8 @@ def is_already_present(track_artists, track_title, existing_tracks):
         artist_match = fuzz.ratio(q_main, ex_main) > 75
         
         if title_match and artist_match:
-            return True
-    return False
+            return ex.get('id')
+    return None
 
 
 def sync_ym_to_sp(log_callback=None, pending_callback=None):
@@ -670,6 +671,15 @@ def sync_ym_to_sp(log_callback=None, pending_callback=None):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     
+    cursor.execute("SELECT ym_id, sp_id FROM mappings")
+    ym_to_sp_map = {r[0]: r[1] for r in cursor.fetchall()}
+    
+    cursor.execute("SELECT key FROM failed_syncs WHERE key LIKE 'ym_to_sp:%'")
+    failed_keys = {r[0] for r in cursor.fetchall()}
+    
+    cursor.execute("SELECT key FROM pending_syncs WHERE key LIKE 'ym_to_sp:%'")
+    pending_keys = {r[0] for r in cursor.fetchall()}
+    
     for ym_track in ym_likes:
         ym_id = str(ym_track['id'])
         artists = ym_track.get('artists', '')
@@ -679,19 +689,11 @@ def sync_ym_to_sp(log_callback=None, pending_callback=None):
         fail_key = f"ym_to_sp:{ym_id}"
         pend_key = fail_key
         
-        cursor.execute("SELECT 1 FROM failed_syncs WHERE key = ?", (fail_key,))
-        is_fail = cursor.fetchone() is not None
-        cursor.execute("SELECT 1 FROM pending_syncs WHERE key = ?", (pend_key,))
-        is_pend = cursor.fetchone() is not None
-        
-        if is_fail or is_pend:
+        if fail_key in failed_keys or pend_key in pending_keys:
             skipped += 1
             continue
             
-        cursor.execute("SELECT sp_id FROM mappings WHERE ym_id = ?", (ym_id,))
-        row = cursor.fetchone()
-        mapped_sp_id = row[0] if row else None
-        
+        mapped_sp_id = ym_to_sp_map.get(ym_id)
         if mapped_sp_id:
             if mapped_sp_id in sp_liked_ids:
                 continue
@@ -705,7 +707,12 @@ def sync_ym_to_sp(log_callback=None, pending_callback=None):
                 logging.error(f"Ошибка при добавлении мапированного трека в Spotify: {e}")
             continue
             
-        if is_already_present(artists, title, sp_likes):
+        matched_sp_id = find_already_present_id(artists, title, sp_likes)
+        if matched_sp_id:
+            cursor.execute("INSERT OR IGNORE INTO mappings (ym_id, sp_id) VALUES (?, ?)", (ym_id, matched_sp_id))
+            conn.commit()
+            ym_to_sp_map[ym_id] = matched_sp_id
+            logging.info(f"🔗 [Сопоставление] Трек уже есть в Spotify по нечеткому совпадению: '{query}' -> ID '{matched_sp_id}'")
             continue
             
         sp_id, best_name, score = match_track_spotify(artists, title, sp_client)
@@ -713,6 +720,7 @@ def sync_ym_to_sp(log_callback=None, pending_callback=None):
             if sp_id in sp_liked_ids:
                 cursor.execute("INSERT OR IGNORE INTO mappings (ym_id, sp_id) VALUES (?, ?)", (ym_id, sp_id))
                 conn.commit()
+                ym_to_sp_map[ym_id] = sp_id
                 logging.info(f"ℹ️ [{score:.0f}%] Трек уже есть в Spotify по ID: '{query}' -> '{best_name}'")
                 continue
                 
@@ -725,6 +733,7 @@ def sync_ym_to_sp(log_callback=None, pending_callback=None):
                     
                     cursor.execute("INSERT OR IGNORE INTO mappings (ym_id, sp_id) VALUES (?, ?)", (ym_id, sp_id))
                     conn.commit()
+                    ym_to_sp_map[ym_id] = sp_id
                     
                     logging.info(f"✅ [{score:.0f}%] Добавлен в Spotify: '{query}' -> как '{best_name}'")
                     added += 1
@@ -736,6 +745,7 @@ def sync_ym_to_sp(log_callback=None, pending_callback=None):
                     (pend_key, "ym_to_sp", query, best_name, sp_id, round(score))
                 )
                 conn.commit()
+                pending_keys.add(pend_key)
                 logging.info(f"⏳ [{score:.0f}%] Ожидает одобрения: '{query}' -> '{best_name}'")
                 pending_count += 1
                 if pending_callback:
@@ -744,11 +754,13 @@ def sync_ym_to_sp(log_callback=None, pending_callback=None):
                 logging.warning(f"❌ [{score:.0f}%] Не найден в Spotify: '{query}'")
                 cursor.execute("INSERT OR REPLACE INTO failed_syncs (key, query) VALUES (?, ?)", (fail_key, query))
                 conn.commit()
+                failed_keys.add(fail_key)
                 failed_count += 1
         else:
             logging.warning(f"❌ [{score:.0f}%] Не найден в Spotify: '{query}'")
             cursor.execute("INSERT OR REPLACE INTO failed_syncs (key, query) VALUES (?, ?)", (fail_key, query))
             conn.commit()
+            failed_keys.add(fail_key)
             failed_count += 1
             
     conn.close()
@@ -779,6 +791,15 @@ def sync_sp_to_ym(log_callback=None, pending_callback=None):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     
+    cursor.execute("SELECT sp_id, ym_id FROM mappings")
+    sp_to_ym_map = {r[0]: r[1] for r in cursor.fetchall()}
+    
+    cursor.execute("SELECT key FROM failed_syncs WHERE key LIKE 'sp_to_ym:%'")
+    failed_keys = {r[0] for r in cursor.fetchall()}
+    
+    cursor.execute("SELECT key FROM pending_syncs WHERE key LIKE 'sp_to_ym:%'")
+    pending_keys = {r[0] for r in cursor.fetchall()}
+    
     for sp_track in sp_likes:
         sp_id = str(sp_track['id'])
         artists = sp_track.get('artists', '')
@@ -788,19 +809,11 @@ def sync_sp_to_ym(log_callback=None, pending_callback=None):
         fail_key = f"sp_to_ym:{sp_id}"
         pend_key = fail_key
         
-        cursor.execute("SELECT 1 FROM failed_syncs WHERE key = ?", (fail_key,))
-        is_fail = cursor.fetchone() is not None
-        cursor.execute("SELECT 1 FROM pending_syncs WHERE key = ?", (pend_key,))
-        is_pend = cursor.fetchone() is not None
-        
-        if is_fail or is_pend:
+        if fail_key in failed_keys or pend_key in pending_keys:
             skipped += 1
             continue
             
-        cursor.execute("SELECT ym_id FROM mappings WHERE sp_id = ?", (sp_id,))
-        row = cursor.fetchone()
-        mapped_ym_id = row[0] if row else None
-        
+        mapped_ym_id = sp_to_ym_map.get(sp_id)
         if mapped_ym_id:
             mapped_ym_id = str(mapped_ym_id)
             if mapped_ym_id in ym_liked_ids:
@@ -815,7 +828,12 @@ def sync_sp_to_ym(log_callback=None, pending_callback=None):
                 logging.error(f"Ошибка при добавлении мапированного трека в Яндекс Музыку: {e}")
             continue
             
-        if is_already_present(artists, title, ym_likes):
+        matched_ym_id = find_already_present_id(artists, title, ym_likes)
+        if matched_ym_id:
+            cursor.execute("INSERT OR IGNORE INTO mappings (ym_id, sp_id) VALUES (?, ?)", (matched_ym_id, sp_id))
+            conn.commit()
+            sp_to_ym_map[sp_id] = matched_ym_id
+            logging.info(f"🔗 [Сопоставление] Трек уже есть в Яндекс по нечеткому совпадению: '{query}' -> ID '{matched_ym_id}'")
             continue
             
         ym_id, best_name, score = match_track_yandex(artists, title, ym_client)
@@ -824,6 +842,7 @@ def sync_sp_to_ym(log_callback=None, pending_callback=None):
             if ym_id in ym_liked_ids:
                 cursor.execute("INSERT OR IGNORE INTO mappings (ym_id, sp_id) VALUES (?, ?)", (ym_id, sp_id))
                 conn.commit()
+                sp_to_ym_map[sp_id] = ym_id
                 logging.info(f"ℹ️ [{score:.0f}%] Трек уже есть в Яндекс по ID: '{query}' -> '{best_name}'")
                 continue
                 
@@ -836,6 +855,7 @@ def sync_sp_to_ym(log_callback=None, pending_callback=None):
                     
                     cursor.execute("INSERT OR IGNORE INTO mappings (ym_id, sp_id) VALUES (?, ?)", (ym_id, sp_id))
                     conn.commit()
+                    sp_to_ym_map[sp_id] = ym_id
                     
                     logging.info(f"✅ [{score:.0f}%] Добавлен в Яндекс: '{query}' -> как '{best_name}'")
                     added += 1
@@ -847,6 +867,7 @@ def sync_sp_to_ym(log_callback=None, pending_callback=None):
                     (pend_key, "sp_to_ym", query, best_name, ym_id, round(score))
                 )
                 conn.commit()
+                pending_keys.add(pend_key)
                 logging.info(f"⏳ [{score:.0f}%] Ожидает одобрения: '{query}' -> '{best_name}'")
                 pending_count += 1
                 if pending_callback:
@@ -855,11 +876,13 @@ def sync_sp_to_ym(log_callback=None, pending_callback=None):
                 logging.warning(f"❌ [{score:.0f}%] Не найден в Яндексе: '{query}'")
                 cursor.execute("INSERT OR REPLACE INTO failed_syncs (key, query) VALUES (?, ?)", (fail_key, query))
                 conn.commit()
+                failed_keys.add(fail_key)
                 failed_count += 1
         else:
             logging.warning(f"❌ [{score:.0f}%] Не найден в Яндексе: '{query}'")
             cursor.execute("INSERT OR REPLACE INTO failed_syncs (key, query) VALUES (?, ?)", (fail_key, query))
             conn.commit()
+            failed_keys.add(fail_key)
             failed_count += 1
             
     conn.close()
