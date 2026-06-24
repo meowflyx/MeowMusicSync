@@ -4,7 +4,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
-TG_ADMIN_ID = int(os.getenv("TG_ADMIN_ID", 0))
+
+_raw_admin_id = os.getenv("TG_ADMIN_ID", "").strip()
+TG_ADMIN_ID = int(_raw_admin_id) if _raw_admin_id.isdigit() else 0
 
 SPOTIPY_CLIENT_ID = os.getenv("SPOTIPY_CLIENT_ID")
 SPOTIPY_CLIENT_SECRET = os.getenv("SPOTIPY_CLIENT_SECRET")

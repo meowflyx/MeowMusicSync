@@ -1,7 +1,10 @@
 .env
 .cache*
 manifest.json
+manifest.json.bak
 sync.log*
 .venv/
 __pycache__/
 *.db
+*.db-wal
+*.db-shm
