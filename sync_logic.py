@@ -353,9 +353,8 @@ def clear_failed_tracks():
     init_db()
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(*) FROM failed_syncs")
-    count = cursor.fetchone()[0]
     cursor.execute("DELETE FROM failed_syncs")
+    count = cursor.rowcount
     conn.commit()
     conn.close()
     return count
@@ -544,9 +543,8 @@ def clear_blacklist():
     init_db()
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(*) FROM blacklist")
-    count = cursor.fetchone()[0]
     cursor.execute("DELETE FROM blacklist")
+    count = cursor.rowcount
     conn.commit()
     conn.close()
     return count
@@ -621,16 +619,6 @@ def normalize(text):
     text = re.sub(r'[^\w\s]', ' ', text)
     text = re.sub(r'\s+', ' ', text)
     return text.strip()
-
-
-def translate_artist(artist_name):
-    """Translate latinized Russian artist name to Cyrillic using maps or transliteration."""
-    key = artist_name.lower().strip()
-    if key in TRANSLIT_MAP:
-        return TRANSLIT_MAP[key]
-    if has_latin(artist_name):
-        return translit_to_cyrillic(artist_name)
-    return artist_name
 
 
 def build_search_queries(artists_str, title):
@@ -913,7 +901,7 @@ def find_already_present_id(track_artists, track_title, existing_tracks):
 
 
 @serialized
-def sync_ym_to_sp(progress_callback=None, pending_callback=None):
+def sync_ym_to_sp():
     """Synchronize liked tracks from Yandex Music to Spotify, preventing duplicates."""
     ym_client = get_ym_client()
     sp_client = get_sp_client()
@@ -929,7 +917,6 @@ def sync_ym_to_sp(progress_callback=None, pending_callback=None):
     failed_count = 0
     pending_count = 0
     skipped = 0
-    total = len(ym_likes)
     
     init_db()
     conn = sqlite3.connect(DB_FILE)
@@ -944,7 +931,7 @@ def sync_ym_to_sp(progress_callback=None, pending_callback=None):
     cursor.execute("SELECT key FROM pending_syncs WHERE key LIKE 'ym_to_sp:%'")
     pending_keys = {r[0] for r in cursor.fetchall()}
     
-    for idx, ym_track in enumerate(ym_likes, 1):
+    for ym_track in ym_likes:
         ym_id = str(ym_track['id'])
         artists = ym_track.get('artists', '')
         title = ym_track.get('title', '')
@@ -1017,8 +1004,6 @@ def sync_ym_to_sp(progress_callback=None, pending_callback=None):
                 pending_keys.add(pend_key)
                 logging.info(f"⏳ [{score:.0f}%] Ожидает одобрения: '{query}' -> '{best_name}'")
                 pending_count += 1
-                if pending_callback:
-                    pending_callback(pend_key, query, best_name, round(score), "ym_to_sp")
             else:
                 logging.warning(f"❌ [{score:.0f}%] Не найден в Spotify: '{query}'")
                 cursor.execute("INSERT OR REPLACE INTO failed_syncs (key, query) VALUES (?, ?)", (fail_key, query))
@@ -1032,8 +1017,6 @@ def sync_ym_to_sp(progress_callback=None, pending_callback=None):
             failed_keys.add(fail_key)
             failed_count += 1
         
-        if progress_callback and idx % 25 == 0:
-            progress_callback(idx, total, "ym_to_sp")
             
     conn.close()
     msg = f"Яндекс → Spotify: добавлено {added}, на одобрении {pending_count}, не найдено {failed_count}."
@@ -1043,7 +1026,7 @@ def sync_ym_to_sp(progress_callback=None, pending_callback=None):
 
 
 @serialized
-def sync_sp_to_ym(progress_callback=None, pending_callback=None):
+def sync_sp_to_ym():
     """Synchronize liked tracks from Spotify to Yandex Music, preventing duplicates."""
     ym_client = get_ym_client()
     sp_client = get_sp_client()
@@ -1059,7 +1042,6 @@ def sync_sp_to_ym(progress_callback=None, pending_callback=None):
     failed_count = 0
     pending_count = 0
     skipped = 0
-    total = len(sp_likes)
     
     init_db()
     conn = sqlite3.connect(DB_FILE)
@@ -1074,7 +1056,7 @@ def sync_sp_to_ym(progress_callback=None, pending_callback=None):
     cursor.execute("SELECT key FROM pending_syncs WHERE key LIKE 'sp_to_ym:%'")
     pending_keys = {r[0] for r in cursor.fetchall()}
     
-    for idx, sp_track in enumerate(sp_likes, 1):
+    for sp_track in sp_likes:
         sp_id = str(sp_track['id'])
         artists = sp_track.get('artists', '')
         title = sp_track.get('title', '')
@@ -1148,8 +1130,6 @@ def sync_sp_to_ym(progress_callback=None, pending_callback=None):
                 pending_keys.add(pend_key)
                 logging.info(f"⏳ [{score:.0f}%] Ожидает одобрения: '{query}' -> '{best_name}'")
                 pending_count += 1
-                if pending_callback:
-                    pending_callback(pend_key, query, best_name, round(score), "sp_to_ym")
             else:
                 logging.warning(f"❌ [{score:.0f}%] Не найден в Яндексе: '{query}'")
                 cursor.execute("INSERT OR REPLACE INTO failed_syncs (key, query) VALUES (?, ?)", (fail_key, query))
@@ -1163,8 +1143,6 @@ def sync_sp_to_ym(progress_callback=None, pending_callback=None):
             failed_keys.add(fail_key)
             failed_count += 1
         
-        if progress_callback and idx % 25 == 0:
-            progress_callback(idx, total, "sp_to_ym")
             
     conn.close()
     msg = f"Spotify → Яндекс: добавлено {added}, на одобрении {pending_count}, не найдено {failed_count}."
@@ -1322,12 +1300,7 @@ def remove_spotify_duplicates():
     delete = []
     
     for t in tracks:
-        is_dup = False
-        for k in keep:
-            if check_duplicate(t, k):
-                is_dup = True
-                break
-        if is_dup:
+        if any(check_duplicate(t, k) for k in keep):
             delete.append(t)
         else:
             keep.append(t)
@@ -1454,12 +1427,7 @@ def remove_yandex_duplicates():
     delete = []
     
     for t in tracks_to_check:
-        is_dup = False
-        for k in keep:
-            if check_duplicate(t, k):
-                is_dup = True
-                break
-        if is_dup:
+        if any(check_duplicate(t, k) for k in keep):
             delete.append(t)
         else:
             keep.append(t)
@@ -1501,11 +1469,11 @@ def remove_yandex_duplicates():
 
 
 @serialized
-def full_two_way_sync(progress_callback=None, pending_callback=None):
+def full_two_way_sync():
     """Execute complete two-way synchronization between Yandex Music and Spotify."""
     try:
-        res1 = sync_ym_to_sp(progress_callback, pending_callback)
-        res2 = sync_sp_to_ym(progress_callback, pending_callback)
+        res1 = sync_ym_to_sp()
+        res2 = sync_sp_to_ym()
         result = f"{res1}\n{res2}"
     except Exception as e:
         logging.error(f"Ошибка при синхронизации: {e}")

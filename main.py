@@ -8,7 +8,7 @@ import asyncio
 import logging
 import sys
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import Command
+from aiogram.filters import Command, CommandObject
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, BotCommand, ErrorEvent
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from logging.handlers import TimedRotatingFileHandler
@@ -107,54 +107,26 @@ async def help_handler(message: Message):
     )
 
 
-@dp.message(Command("sync_all", "sync"))
-async def sync_all_handler(message: Message):
-    """Trigger manual full two-way synchronization."""
+@dp.message(Command("sync_all", "sync", "sync_ym_sp", "sync_sp_ym"))
+async def sync_handler(message: Message, command: CommandObject):
+    """Run the requested synchronization direction."""
     if message.from_user.id != TG_ADMIN_ID:
         return
     if is_sync_running():
         return await message.answer("⏳ Синхронизация уже выполняется. Подождите.")
-    await message.answer("🔄 Начинаю полную синхронизацию...")
+    operation, direction = {
+        "sync": (full_two_way_sync, "в обе стороны"),
+        "sync_all": (full_two_way_sync, "в обе стороны"),
+        "sync_ym_sp": (sync_ym_to_sp, "Яндекс → Spotify"),
+        "sync_sp_ym": (sync_sp_to_ym, "Spotify → Яндекс"),
+    }[command.command]
+    await message.answer(f"🔄 Начинаю синхронизацию {direction}...")
     try:
         loop = asyncio.get_running_loop()
-        res = await loop.run_in_executor(None, full_two_way_sync)
+        res = await loop.run_in_executor(None, operation)
         await message.answer(f"✅ Готово:\n{res}\nОдобрения: /pending")
     except Exception as e:
-        logging.error(f"Ошибка полной синхронизации: {e}")
-        await message.answer(f"❌ Ошибка: {e}")
-
-
-@dp.message(Command("sync_ym_sp"))
-async def sync_ym_sp_handler(message: Message):
-    """Trigger manual Yandex Music to Spotify synchronization."""
-    if message.from_user.id != TG_ADMIN_ID:
-        return
-    if is_sync_running():
-        return await message.answer("⏳ Синхронизация уже выполняется. Подождите.")
-    await message.answer("🔄 Начинаю синхронизацию Яндекс → Spotify...")
-    try:
-        loop = asyncio.get_running_loop()
-        res = await loop.run_in_executor(None, sync_ym_to_sp)
-        await message.answer(f"✅ Готово:\n{res}\nОдобрения: /pending")
-    except Exception as e:
-        logging.error(f"Ошибка синхронизации YM→SP: {e}")
-        await message.answer(f"❌ Ошибка: {e}")
-
-
-@dp.message(Command("sync_sp_ym"))
-async def sync_sp_ym_handler(message: Message):
-    """Trigger manual Spotify to Yandex Music synchronization."""
-    if message.from_user.id != TG_ADMIN_ID:
-        return
-    if is_sync_running():
-        return await message.answer("⏳ Синхронизация уже выполняется. Подождите.")
-    await message.answer("🔄 Начинаю синхронизацию Spotify → Яндекс...")
-    try:
-        loop = asyncio.get_running_loop()
-        res = await loop.run_in_executor(None, sync_sp_to_ym)
-        await message.answer(f"✅ Готово:\n{res}\nОдобрения: /pending")
-    except Exception as e:
-        logging.error(f"Ошибка синхронизации SP→YM: {e}")
+        logging.error(f"Ошибка синхронизации {direction}: {e}")
         await message.answer(f"❌ Ошибка: {e}")
 
 

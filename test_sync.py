@@ -28,6 +28,14 @@ class SyncRegressionTests(unittest.TestCase):
         self.assertFalse(sync.check_duplicate({"artists": "", "title": ""},
                                               {"artists": "", "title": ""}))
 
+    def test_clear_returns_deleted_count(self):
+        with closing(sqlite3.connect(sync.DB_FILE)) as db, db:
+            db.execute("INSERT INTO failed_syncs VALUES ('x', 'song')")
+            db.execute("INSERT INTO blacklist VALUES ('1', 'a', 'artist', 'song')")
+        for clear in (sync.clear_failed_tracks, sync.clear_blacklist):
+            self.assertEqual(clear(), 1)
+            self.assertEqual(clear(), 0)
+
     def test_versions_are_not_duplicates_even_with_similar_titles(self):
         self.assertFalse(sync.check_duplicate(
             {"artists": "Artist", "title": "A very long song title about our beautiful world"},
@@ -129,6 +137,23 @@ class BotRegressionTests(unittest.IsolatedAsyncioTestCase):
         import config
         with patch.object(config, "TG_BOT_TOKEN", "123456:offline_test_token"), patch.object(config, "TG_ADMIN_ID", 42), patch("logging.handlers.TimedRotatingFileHandler", return_value=logging.NullHandler()):
             cls.bot = importlib.import_module("main")
+
+    async def test_sync_commands_select_direction_and_reject_non_admin(self):
+        sent = []
+        async def answer(text, **kw):
+            sent.append(text)
+        message = SimpleNamespace(from_user=SimpleNamespace(id=42), answer=answer)
+        with patch.object(self.bot, "is_sync_running", return_value=False), patch.multiple(
+            self.bot, full_two_way_sync=lambda: "both", sync_ym_to_sp=lambda: "to Spotify",
+            sync_sp_to_ym=lambda: "to Yandex"):
+            for command, result in [("sync", "both"), ("sync_all", "both"),
+                                    ("sync_ym_sp", "to Spotify"), ("sync_sp_ym", "to Yandex")]:
+                await self.bot.sync_handler(message, SimpleNamespace(command=command))
+                self.assertIn(result, sent[-1])
+            sent.clear()
+            message.from_user.id = 99
+            await self.bot.sync_handler(message, SimpleNamespace(command="sync"))
+            self.assertEqual(sent, [])
 
     async def test_long_lines_and_emoji_fit_telegram_limit(self):
         sent = []
