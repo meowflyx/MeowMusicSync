@@ -6,11 +6,10 @@ and viewing statistics, all backed by an SQLite database.
 
 import asyncio
 import logging
-import signal
 import sys
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, BotCommand, ErrorEvent
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from logging.handlers import TimedRotatingFileHandler
 from config import TG_BOT_TOKEN, TG_ADMIN_ID
@@ -21,57 +20,19 @@ from sync_logic import (
     get_blacklist, clear_blacklist, remove_spotify_duplicates,
     remove_yandex_duplicates, get_last_sync_info, is_sync_running,
     get_recent_logs, check_api_health, add_manual_mapping,
-    remove_from_blacklist, clear_stale_sync_lock
+    remove_from_blacklist
 )
 
 log_handler = TimedRotatingFileHandler('sync.log', when='midnight', interval=1, backupCount=7)
 log_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
 logging.basicConfig(level=logging.INFO, handlers=[log_handler, logging.StreamHandler()])
 
-if not TG_BOT_TOKEN:
-    logging.error("TG_BOT_TOKEN не задан. Создайте .env файл на основе .env.example.")
+if not TG_BOT_TOKEN or not TG_ADMIN_ID:
+    logging.error("Задайте TG_BOT_TOKEN и числовой TG_ADMIN_ID в .env.")
     sys.exit(1)
 
 bot = Bot(token=TG_BOT_TOKEN)
 dp = Dispatcher()
-_shutdown_event = asyncio.Event()
-
-
-def get_pending_cb(loop):
-    """Return a callback function to send Telegram notifications for pending approvals."""
-    def cb(pend_key, source, found, score, direction):
-        if not TG_ADMIN_ID:
-            return
-        arrow = "🟡 YM → SP" if direction == "ym_to_sp" else "🔵 SP → YM"
-        text = (
-            f"⏳ Требуется одобрение ({score}%)\n"
-            f"{arrow}\n\n"
-            f"🔍 Искали: {source}\n"
-            f"📀 Нашли: {found}"
-        )
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text="✅ Добавить", callback_data=f"approve:{pend_key}"),
-                InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject:{pend_key}"),
-            ]
-        ])
-        asyncio.run_coroutine_threadsafe(bot.send_message(TG_ADMIN_ID, text, reply_markup=kb), loop)
-    return cb
-
-
-def get_progress_cb(loop, chat_id):
-    """Return a callback that sends periodic progress updates to the admin chat."""
-    last_sent = {"text": ""}
-    def cb(current, total, direction):
-        if not TG_ADMIN_ID:
-            return
-        arrow = "🟡 YM → SP" if direction == "ym_to_sp" else "🔵 SP → YM"
-        text = f"⏳ Прогресс {arrow}: {current}/{total}"
-        if text == last_sent["text"]:
-            return
-        last_sent["text"] = text
-        asyncio.run_coroutine_threadsafe(bot.send_message(chat_id, text), loop)
-    return cb
 
 
 async def send_long_message(message: Message, header: str, lines: list, chunk_limit: int = 4000):
@@ -80,16 +41,17 @@ async def send_long_message(message: Message, header: str, lines: list, chunk_li
         await message.answer(f"{header}\n(пусто)")
         return
     
-    current = header
-    for line in lines:
-        candidate = f"{current}\n{line}" if current and current != header else (
-            f"{header}\n{line}" if current == header else line
-        )
-        if len(candidate) > chunk_limit:
+    text = "\n".join([header, *lines])
+    # Telegram counts UTF-16 units: astral characters take two units.
+    current = ""
+    units = 0
+    for char in text:
+        size = 2 if ord(char) > 0xFFFF else 1
+        if units + size > chunk_limit:
             await message.answer(current)
-            current = f"{line}"
-        else:
-            current = candidate
+            current, units = "", 0
+        current += char
+        units += size
     if current:
         await message.answer(current)
 
@@ -97,11 +59,13 @@ async def send_long_message(message: Message, header: str, lines: list, chunk_li
 async def periodic_sync():
     """Background task to run two-way sync periodically."""
     try:
+        if is_sync_running():
+            return
         loop = asyncio.get_running_loop()
-        res = await loop.run_in_executor(None, full_two_way_sync, None, get_pending_cb(loop))
+        res = await loop.run_in_executor(None, full_two_way_sync)
         logging.info(f"Фоновая синхронизация завершена:\n{res}")
         if TG_ADMIN_ID:
-            await bot.send_message(TG_ADMIN_ID, f"🔄 Фоновая синхронизация завершена:\n{res}")
+            await bot.send_message(TG_ADMIN_ID, f"🔄 Фоновая синхронизация завершена:\n{res}\nОдобрения: /pending", disable_notification=True)
     except Exception as e:
         logging.error(f"Ошибка фоновой синхронизации: {e}")
         if TG_ADMIN_ID:
@@ -124,18 +88,18 @@ async def help_handler(message: Message):
     await message.answer(
         "🎵 Бот синхронизации музыки\n\n"
         "Команды:\n"
-        "/sync_all - Полная синхронизация (в обе стороны)\n"
+        "/sync или /sync_all - Полная синхронизация (в обе стороны)\n"
         "/sync_ym_sp - Яндекс → Spotify\n"
         "/sync_sp_ym - Spotify → Яндекс\n"
         "/status - Статистика\n"
-        "/pending - Показать ожидающие одобрения\n"
+        "/pending [страница] - Одобрения, по 5 треков\n"
         "/retry_failed - Очистить кэш ненайденных\n"
         "/list_failed - Список ненайденных\n"
         "/blacklist - Показать блеклист\n"
         "/clear_blacklist - Очистить блеклист\n"
         "/unblacklist <ym_id|sp_id> - Удалить один трек из блеклиста\n"
-        "/clean_sp_dupes - Удалить дубликаты из Spotify\n"
-        "/clean_ym_dupes - Удалить дубликаты из Яндекс Музыки\n"
+        "/clean_sp_dupes - Удалить дубликаты из Spotify (с подтверждением)\n"
+        "/clean_ym_dupes - Удалить дубликаты из Яндекс Музыки (с подтверждением)\n"
         "/last_sync - Информация о последней синхронизации\n"
         "/logs [n] - Последние n строк лога (по умолчанию 20)\n"
         "/health - Проверка доступности API\n"
@@ -143,7 +107,7 @@ async def help_handler(message: Message):
     )
 
 
-@dp.message(Command("sync_all"))
+@dp.message(Command("sync_all", "sync"))
 async def sync_all_handler(message: Message):
     """Trigger manual full two-way synchronization."""
     if message.from_user.id != TG_ADMIN_ID:
@@ -153,9 +117,8 @@ async def sync_all_handler(message: Message):
     await message.answer("🔄 Начинаю полную синхронизацию...")
     try:
         loop = asyncio.get_running_loop()
-        progress_cb = get_progress_cb(loop, message.chat.id)
-        res = await loop.run_in_executor(None, full_two_way_sync, progress_cb, get_pending_cb(loop))
-        await message.answer(f"✅ Готово:\n{res}")
+        res = await loop.run_in_executor(None, full_two_way_sync)
+        await message.answer(f"✅ Готово:\n{res}\nОдобрения: /pending")
     except Exception as e:
         logging.error(f"Ошибка полной синхронизации: {e}")
         await message.answer(f"❌ Ошибка: {e}")
@@ -171,9 +134,8 @@ async def sync_ym_sp_handler(message: Message):
     await message.answer("🔄 Начинаю синхронизацию Яндекс → Spotify...")
     try:
         loop = asyncio.get_running_loop()
-        progress_cb = get_progress_cb(loop, message.chat.id)
-        res = await loop.run_in_executor(None, sync_ym_to_sp, progress_cb, get_pending_cb(loop))
-        await message.answer(f"✅ Готово:\n{res}")
+        res = await loop.run_in_executor(None, sync_ym_to_sp)
+        await message.answer(f"✅ Готово:\n{res}\nОдобрения: /pending")
     except Exception as e:
         logging.error(f"Ошибка синхронизации YM→SP: {e}")
         await message.answer(f"❌ Ошибка: {e}")
@@ -189,9 +151,8 @@ async def sync_sp_ym_handler(message: Message):
     await message.answer("🔄 Начинаю синхронизацию Spotify → Яндекс...")
     try:
         loop = asyncio.get_running_loop()
-        progress_cb = get_progress_cb(loop, message.chat.id)
-        res = await loop.run_in_executor(None, sync_sp_to_ym, progress_cb, get_pending_cb(loop))
-        await message.answer(f"✅ Готово:\n{res}")
+        res = await loop.run_in_executor(None, sync_sp_to_ym)
+        await message.answer(f"✅ Готово:\n{res}\nОдобрения: /pending")
     except Exception as e:
         logging.error(f"Ошибка синхронизации SP→YM: {e}")
         await message.answer(f"❌ Ошибка: {e}")
@@ -222,13 +183,20 @@ async def pending_handler(message: Message):
     if not pending:
         return await message.answer("Нет треков на одобрении.")
     
-    for key, entry in pending.items():
+    args = message.text.split()[1:]
+    if args and (not args[0].isascii() or not args[0].isdigit() or len(args[0]) > 6 or int(args[0]) < 1):
+        return await message.answer("Использование: /pending [номер страницы от 1]")
+    page = int(args[0]) if args else 1
+    pages = (len(pending) + 4) // 5
+    if page > pages:
+        return await message.answer(f"Всего страниц: {pages}. Начать: /pending")
+    for key, entry in list(pending.items())[(page - 1) * 5:page * 5]:
         arrow = "🟡 YM → SP" if entry["direction"] == "ym_to_sp" else "🔵 SP → YM"
         text = (
             f"⏳ Одобрение ({entry['score']}%)\n"
             f"{arrow}\n\n"
-            f"🔍 Искали: {entry['source']}\n"
-            f"📀 Нашли: {entry['found']}"
+            f"🔍 Искали: {entry['source'][:700]}\n"
+            f"📀 Нашли: {entry['found'][:700]}"
         )
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [
@@ -237,6 +205,9 @@ async def pending_handler(message: Message):
             ]
         ])
         await message.answer(text, reply_markup=kb)
+    await message.answer(f"Страница {page}/{pages}. Всего: {len(pending)}.\n"
+                         + (f"Далее: /pending {page + 1}\n" if page < pages else "")
+                         + "После решений очередь сдвигается — обновить: /pending")
 
 
 @dp.message(Command("retry_failed"))
@@ -274,7 +245,7 @@ async def blacklist_handler(message: Message):
     if not bl:
         return await message.answer("Блеклист пуст.")
     
-    lines = [f"⚫ {item['artists']} - {item['title']}" for item in bl]
+    lines = [f"⚫ {item['artists']} - {item['title']} (YM: {item['ym_id']}, SP: {item['sp_id']})" for item in bl]
     await send_long_message(message, "📋 Блеклист:", lines)
 
 
@@ -308,6 +279,8 @@ async def clean_sp_dupes_handler(message: Message):
     """Remove duplicate tracks from Spotify saved tracks."""
     if message.from_user.id != TG_ADMIN_ID:
         return
+    if message.text.split()[1:] != ["confirm"]:
+        return await message.answer("⚠️ Удаление лайков по похожим названиям необратимо и может ошибаться.\nПодтвердить: /clean_sp_dupes confirm")
     await message.answer("🔄 Сканирую библиотеку Spotify на наличие дубликатов...")
     loop = asyncio.get_running_loop()
     success, res = await loop.run_in_executor(None, remove_spotify_duplicates)
@@ -326,6 +299,8 @@ async def clean_ym_dupes_handler(message: Message):
     """Remove duplicate tracks from Yandex Music liked tracks."""
     if message.from_user.id != TG_ADMIN_ID:
         return
+    if message.text.split()[1:] != ["confirm"]:
+        return await message.answer("⚠️ Удаление лайков по похожим названиям необратимо и может ошибаться.\nПодтвердить: /clean_ym_dupes confirm")
     await message.answer("🔄 Сканирую библиотеку Яндекс Музыки на наличие дубликатов...")
     loop = asyncio.get_running_loop()
     success, res = await loop.run_in_executor(None, remove_yandex_duplicates)
@@ -361,8 +336,10 @@ async def logs_handler(message: Message):
         return
     args = message.text.split()[1:]
     n = 20
-    if args and args[0].isdigit():
-        n = min(int(args[0]), 100)
+    if args:
+        if not args[0].isascii() or not args[0].isdigit() or len(args[0]) > 3 or not 1 <= int(args[0]) <= 100:
+            return await message.answer("Использование: /logs [число от 1 до 100]")
+        n = int(args[0])
     lines = get_recent_logs(n)
     if not lines:
         return await message.answer("Лог пуст или файл недоступен.")
@@ -407,14 +384,14 @@ async def approve_callback(callback: CallbackQuery):
         return await callback.answer("Нет доступа")
     
     pend_key = callback.data.split(":", 1)[1]
+    await callback.answer("Обрабатываю…")
     loop = asyncio.get_running_loop()
     ok, msg = await loop.run_in_executor(None, approve_pending, pend_key)
     
     if ok:
         await callback.message.edit_text(f"✅ {msg}")
     else:
-        await callback.message.edit_text(f"⚠️ {msg}")
-    await callback.answer()
+        await callback.message.answer(f"⚠️ {msg}")
 
 
 @dp.callback_query(F.data.startswith("reject:"))
@@ -424,36 +401,47 @@ async def reject_callback(callback: CallbackQuery):
         return await callback.answer("Нет доступа")
     
     pend_key = callback.data.split(":", 1)[1]
+    await callback.answer("Обрабатываю…")
     loop = asyncio.get_running_loop()
     ok, msg = await loop.run_in_executor(None, reject_pending, pend_key)
     
     if ok:
         await callback.message.edit_text(f"❌ {msg}")
     else:
-        await callback.message.edit_text(f"⚠️ {msg}")
-    await callback.answer()
+        await callback.message.answer(f"⚠️ {msg}")
 
 
-def _handle_shutdown(signum, frame):
-    """Signal handler that triggers graceful shutdown."""
-    logging.info(f"Получен сигнал {signum}. Начинаю graceful shutdown...")
-    _shutdown_event.set()
+@dp.errors()
+async def handle_error(event: ErrorEvent):
+    logging.error("Ошибка команды", exc_info=event.exception)
+    message = event.update.message or (event.update.callback_query.message if event.update.callback_query else None)
+    user = event.update.message.from_user if event.update.message else (event.update.callback_query.from_user if event.update.callback_query else None)
+    if message and user and user.id == TG_ADMIN_ID:
+        await message.answer(f"⚠️ Операция не завершена: {str(event.exception)[:500]}\nМожно повторить команду. /help")
+    return True
+
+
+@dp.message(F.text.startswith("/"))
+async def unknown_command(message: Message):
+    if message.from_user.id == TG_ADMIN_ID:
+        await message.answer("Неизвестная команда. Синхронизация: /sync. Все команды: /help")
 
 
 async def main():
     """Start the scheduler for periodic sync and start Telegram bot polling."""
-    clear_stale_sync_lock()
-    logging.info("Проверка устаревших блокировок синхронизации выполнена.")
-    
-    signal.signal(signal.SIGINT, _handle_shutdown)
-    signal.signal(signal.SIGTERM, _handle_shutdown)
+    await bot.set_my_commands([BotCommand(command=command, description=description) for command, description in [
+        ("sync", "Синхронизировать в обе стороны"), ("pending", "Одобрить совпадения"),
+        ("status", "Статистика"), ("last_sync", "Последняя синхронизация"), ("help", "Все команды")]])
     
     scheduler = AsyncIOScheduler()
     scheduler.add_job(periodic_sync, 'interval', hours=3)
     scheduler.start()
     logging.info("Планировщик запущен. Интервал синхронизации: 3 часа.")
         
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        scheduler.shutdown(wait=False)
 
 
 if __name__ == "__main__":

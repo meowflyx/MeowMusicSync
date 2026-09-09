@@ -12,6 +12,11 @@ import re
 import unicodedata
 import time
 import sqlite3
+import fcntl
+import threading
+from contextlib import contextmanager
+from functools import wraps
+from collections import deque
 from yandex_music import Client
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
@@ -22,6 +27,42 @@ from config import (
 )
 
 DB_FILE = "sync_data.db"
+
+# ponytail: one account on one Linux host; distributed workers need a shared lock.
+_operation_lock = threading.RLock()
+_operation_state = threading.local()
+
+
+@contextmanager
+def music_operation():
+    """Exclude concurrent threads/processes; nested two-way sync is reentrant."""
+    if not _operation_lock.acquire(blocking=False):
+        raise RuntimeError("Операция уже выполняется. Подождите и повторите команду.")
+    try:
+        if getattr(_operation_state, "active", False):
+            yield
+            return
+        with open(DB_FILE + ".lock", "a") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise RuntimeError("Операция уже выполняется. Подождите и повторите команду.") from None
+            _operation_state.active = True
+            try:
+                yield
+            finally:
+                _operation_state.active = False
+                fcntl.flock(lock, fcntl.LOCK_UN)
+    finally:
+        _operation_lock.release()
+
+
+def serialized(func):
+    @wraps(func)
+    def wrapped(*args, **kwargs):
+        with music_operation():
+            return func(*args, **kwargs)
+    return wrapped
 
 TRANSLIT_MAP = {
     "korol i shut": "Король и Шут",
@@ -306,6 +347,7 @@ def get_pending_tracks():
     }
 
 
+@serialized
 def clear_failed_tracks():
     """Delete all records from failed_syncs table and return the count of deleted items."""
     init_db()
@@ -388,11 +430,13 @@ def get_last_sync_info():
 def is_sync_running():
     """Check if a sync is currently in progress."""
     try:
-        return get_setting("sync_in_progress") == "1"
-    except Exception:
-        return False
+        with music_operation():
+            return False
+    except RuntimeError:
+        return True
 
 
+@serialized
 def remove_from_blacklist(ym_id=None, sp_id=None):
     """Remove tracks from blacklist by ym_id and/or sp_id. Returns count of removed rows."""
     init_db()
@@ -416,6 +460,7 @@ def remove_from_blacklist(ym_id=None, sp_id=None):
     return count
 
 
+@serialized
 def add_manual_mapping(ym_id, sp_id):
     """Manually link a Yandex Music track ID to a Spotify track ID."""
     init_db()
@@ -436,8 +481,8 @@ def get_recent_logs(n=20):
         return []
     try:
         with open(log_path, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-        return [line.rstrip("\n") for line in lines[-n:]]
+            lines = deque(f, maxlen=max(0, min(n, 100)))
+        return [line.rstrip("\n") for line in lines]
     except Exception:
         return []
 
@@ -446,25 +491,25 @@ def check_api_health():
     """Test connectivity to Yandex Music and Spotify APIs. Returns dict of statuses."""
     result = {"yandex": False, "spotify": False, "yandex_error": None, "spotify_error": None}
     
-    ym_client = get_ym_client()
-    if ym_client:
-        try:
+    try:
+        ym_client = get_ym_client()
+        if ym_client:
             ym_client.users_likes_tracks()
             result["yandex"] = True
-        except Exception as e:
-            result["yandex_error"] = str(e)
-    else:
-        result["yandex_error"] = "Токен не настроен"
+        else:
+            result["yandex_error"] = "Токен не настроен"
+    except Exception as e:
+        result["yandex_error"] = str(e)
     
-    sp_client = get_sp_client()
-    if sp_client:
-        try:
+    try:
+        sp_client = get_sp_client()
+        if sp_client:
             sp_client.current_user()
             result["spotify"] = True
-        except Exception as e:
-            result["spotify_error"] = str(e)
-    else:
-        result["spotify_error"] = "Учётные данные не настроены"
+        else:
+            result["spotify_error"] = "Учётные данные не настроены"
+    except Exception as e:
+        result["spotify_error"] = str(e)
     
     return result
 
@@ -493,6 +538,7 @@ def get_blacklist():
     return [{"ym_id": r[0], "sp_id": r[1], "artists": r[2], "title": r[3]} for r in rows]
 
 
+@serialized
 def clear_blacklist():
     """Clear all tracks from the blacklist and return the count."""
     init_db()
@@ -539,6 +585,8 @@ def get_sp_client():
         scope="user-library-read user-library-modify",
         open_browser=False
     )
+    if not auth_manager.validate_token(auth_manager.cache_handler.get_cached_token()):
+        raise RuntimeError("Spotify не авторизован. Выполните .venv/bin/python auth_spotify.py на сервере.")
     return spotipy.Spotify(auth_manager=auth_manager)
 
 
@@ -624,6 +672,8 @@ def build_search_queries(artists_str, title):
 
 def score_match(query_artists, query_title, result_artists, result_title):
     """Calculate similarity score between search query details and search result metadata."""
+    if not all(s.strip() for s in (query_artists, query_title, result_artists, result_title)):
+        return 0
     q_title_clean = normalize(clean_title(query_title))
     r_title_clean = normalize(clean_title(result_title))
     
@@ -694,7 +744,7 @@ def match_track_spotify(query_artists, query_title, sp_client):
         )
         if err:
             logging.warning(f"Поиск в Spotify не удался для '{q}': {err}")
-            continue
+            raise err
         if not results['tracks']['items']:
             continue
         
@@ -728,7 +778,7 @@ def match_track_yandex(query_artists, query_title, ym_client):
         results, err = api_call_with_retry(ym_client.search, q, type_='track')
         if err:
             logging.warning(f"Поиск в Яндекс Музыке не удался для '{q}': {err}")
-            continue
+            raise err
         if not results.tracks or not results.tracks.results:
             continue
             
@@ -775,7 +825,7 @@ def get_ym_likes(ym_client):
         tid = str(t.id)
         cursor.execute("SELECT artists, title, query FROM yandex_cache WHERE id = ?", (tid,))
         row = cursor.fetchone()
-        if row:
+        if row and row[0] and row[1]:
             res.append({"id": tid, "artists": row[0], "title": row[1], "search_query": row[2]})
         else:
             fetch_id = f"{t.id}:{t.album_id}" if t.album_id else str(t.id)
@@ -809,6 +859,8 @@ def get_ym_likes(ym_client):
             
         conn.commit()
     conn.close()
+    if {str(t.id) for t in tracks_short} != {t['id'] for t in res}:
+        raise RuntimeError("Яндекс вернул неполную библиотеку. Синхронизация остановлена; повторите позже.")
     return res
 
 
@@ -825,10 +877,12 @@ def get_sp_likes(sp_client):
         new_tracks = []
         for item in results['items']:
             track = item['track']
+            if not track or not track.get('id') or track.get('is_local'):
+                continue
             tid = track['id']
             cursor.execute("SELECT artists, title, query FROM spotify_cache WHERE id = ?", (tid,))
             row = cursor.fetchone()
-            if row:
+            if row and row[0] and row[1]:
                 res.append({"id": tid, "artists": row[0], "title": row[1], "search_query": row[2]})
             else:
                 artists = ", ".join([a['name'] for a in track['artists']])
@@ -852,29 +906,19 @@ def get_sp_likes(sp_client):
 
 def find_already_present_id(track_artists, track_title, existing_tracks):
     """Find and return the ID of a matching track in the existing tracks list, or None."""
-    q_title = normalize(clean_title(track_title))
-    q_artists = [normalize(translate_artist(a.strip())) for a in track_artists.split(',')]
-    q_main = q_artists[0] if q_artists else ""
-    
     for ex in existing_tracks:
-        ex_title = normalize(clean_title(ex.get('title', '')))
-        ex_artists = [normalize(translate_artist(a.strip())) for a in ex.get('artists', '').split(',')]
-        ex_main = ex_artists[0] if ex_artists else ""
-        
-        title_match = fuzz.ratio(q_title, ex_title) > 85 or fuzz.token_sort_ratio(q_title, ex_title) > 85
-        artist_match = fuzz.ratio(q_main, ex_main) > 75
-        
-        if title_match and artist_match:
+        if score_match(track_artists, track_title, ex.get('artists', ''), ex.get('title', '')) >= SCORE_AUTO_ACCEPT:
             return ex.get('id')
     return None
 
 
+@serialized
 def sync_ym_to_sp(progress_callback=None, pending_callback=None):
     """Synchronize liked tracks from Yandex Music to Spotify, preventing duplicates."""
     ym_client = get_ym_client()
     sp_client = get_sp_client()
     if not ym_client or not sp_client:
-        return "Клиенты не настроены"
+        raise RuntimeError("Клиенты не настроены. Проверьте токены в .env и выполните /health.")
 
     ym_likes = get_ym_likes(ym_client)
     sp_likes = get_sp_likes(sp_client)
@@ -953,7 +997,8 @@ def sync_ym_to_sp(progress_callback=None, pending_callback=None):
                     logging.error(f"Ошибка при добавлении трека в Spotify: {err}")
                     failed_count += 1
                 else:
-                    cursor.execute("INSERT OR REPLACE INTO spotify_cache (id, artists, title, query) VALUES (?, ?, ?, ?)", (sp_id, artists, title, best_name))
+                    # Fetch actual destination metadata next time, not the source's title.
+                    cursor.execute("DELETE FROM spotify_cache WHERE id = ?", (sp_id,))
                     sp_likes.append({"id": sp_id, "artists": artists, "title": title, "search_query": best_name})
                     sp_liked_ids.add(sp_id)
                     
@@ -997,12 +1042,13 @@ def sync_ym_to_sp(progress_callback=None, pending_callback=None):
     return msg
 
 
+@serialized
 def sync_sp_to_ym(progress_callback=None, pending_callback=None):
     """Synchronize liked tracks from Spotify to Yandex Music, preventing duplicates."""
     ym_client = get_ym_client()
     sp_client = get_sp_client()
     if not ym_client or not sp_client:
-        return "Клиенты не настроены"
+        raise RuntimeError("Клиенты не настроены. Проверьте токены в .env и выполните /health.")
 
     sp_likes = get_sp_likes(sp_client)
     ym_likes = get_ym_likes(ym_client)
@@ -1083,7 +1129,7 @@ def sync_sp_to_ym(progress_callback=None, pending_callback=None):
                     logging.error(f"Ошибка при добавлении трека в Яндекс Музыку: {err}")
                     failed_count += 1
                 else:
-                    cursor.execute("INSERT OR REPLACE INTO yandex_cache (id, artists, title, query) VALUES (?, ?, ?, ?)", (ym_id, artists, title, best_name))
+                    cursor.execute("DELETE FROM yandex_cache WHERE id = ?", (ym_id,))
                     ym_likes.append({"id": ym_id, "artists": artists, "title": title, "search_query": best_name})
                     ym_liked_ids.add(ym_id)
                     
@@ -1127,6 +1173,7 @@ def sync_sp_to_ym(progress_callback=None, pending_callback=None):
     return msg
 
 
+@serialized
 def approve_pending(pend_key):
     """Approve a pending track match, add it to likes, add mapping, and delete from pending."""
     init_db()
@@ -1153,7 +1200,7 @@ def approve_pending(pend_key):
         if err:
             conn.close()
             return False, f"Ошибка при добавлении в Яндекс: {err}"
-        cursor.execute("INSERT OR REPLACE INTO yandex_cache (id, artists, title, query) VALUES (?, ?, ?, ?)", (found_id, "", "", found_name))
+        cursor.execute("DELETE FROM yandex_cache WHERE id = ?", (found_id,))
         if source_id:
             cursor.execute("INSERT OR IGNORE INTO mappings (ym_id, sp_id) VALUES (?, ?)", (found_id, source_id))
         logging.info(f"✅ Одобрен: '{source_name}' -> '{found_name}'")
@@ -1166,7 +1213,7 @@ def approve_pending(pend_key):
         if err:
             conn.close()
             return False, f"Ошибка при добавлении в Spotify: {err}"
-        cursor.execute("INSERT OR REPLACE INTO spotify_cache (id, artists, title, query) VALUES (?, ?, ?, ?)", (found_id, "", "", found_name))
+        cursor.execute("DELETE FROM spotify_cache WHERE id = ?", (found_id,))
         if source_id:
             cursor.execute("INSERT OR IGNORE INTO mappings (ym_id, sp_id) VALUES (?, ?)", (source_id, found_id))
         logging.info(f"✅ Одобрен: '{source_name}' -> '{found_name}'")
@@ -1180,6 +1227,7 @@ def approve_pending(pend_key):
     return True, f"Добавлен: {found_name}"
 
 
+@serialized
 def reject_pending(pend_key):
     """Reject a pending track match and move it to failed_syncs."""
     init_db()
@@ -1213,27 +1261,26 @@ def check_duplicate(track1, track2):
     """Check if track1 is a fuzzy duplicate of track2, considering artists and version tags."""
     a1 = normalize(track1.get('artists', '').split(',')[0])
     a2 = normalize(track2.get('artists', '').split(',')[0])
+    if not a1 or not a2 or not track1.get('title') or not track2.get('title'):
+        return False
     if fuzz.ratio(a1, a2) < 80:
         return False
         
     rt1 = normalize(track1.get('title', ''))
     rt2 = normalize(track2.get('title', ''))
+    for word in ("remix", "cover", "live", "acoustic", "instrumental", "karaoke", "slowed", "sped up", "nightcore"):
+        if bool(re.search(r'\b' + word + r'\b', rt1)) != bool(re.search(r'\b' + word + r'\b', rt2)):
+            return False
     if fuzz.ratio(rt1, rt2) >= 95:
         return True
         
     ct1 = normalize(clean_duplicate_title(track1.get('title', '')))
     ct2 = normalize(clean_duplicate_title(track2.get('title', '')))
     
-    if fuzz.ratio(ct1, ct2) >= 95:
-        mismatch_words = ["remix", "cover", "live", "acoustic", "instrumental", "karaoke", "slowed", "sped up", "nightcore"]
-        for word in mismatch_words:
-            if (word in rt1) != (word in rt2):
-                return False
-        return True
-        
-    return False
+    return bool(ct1 and ct2 and fuzz.ratio(ct1, ct2) >= 95)
 
 
+@serialized
 def remove_spotify_duplicates():
     """Find and delete duplicate tracks in Spotify saved tracks, keeping the newest."""
     sp_client = get_sp_client()
@@ -1247,6 +1294,8 @@ def remove_spotify_duplicates():
         while results:
             for item in results['items']:
                 track = item['track']
+                if not track or not track.get('id') or track.get('is_local'):
+                    continue
                 added_at = item.get('added_at', '')
                 artists = ", ".join([a['name'] for a in track['artists']])
                 title = track['name']
@@ -1320,9 +1369,12 @@ def remove_spotify_duplicates():
     conn.close()
 
     deleted_list = [f"⚫ {t['artists']} - {t['title']}" for t in deleted_tracks]
+    if failed_actual:
+        return False, f"Удалено: {len(deleted_actual)}. Не удалось удалить: {len(failed_actual)}. Повторите позже."
     return True, deleted_list
 
 
+@serialized
 def remove_yandex_duplicates():
     """Find and delete duplicate tracks in Yandex Music liked tracks, keeping the newest."""
     ym_client = get_ym_client()
@@ -1353,7 +1405,7 @@ def remove_yandex_duplicates():
         tid = str(t.id)
         cursor.execute("SELECT artists, title FROM yandex_cache WHERE id = ?", (tid,))
         row = cursor.fetchone()
-        if row:
+        if row and row[0] and row[1]:
             tracks_to_check.append({
                 "id": tid,
                 "artists": row[0],
@@ -1443,53 +1495,22 @@ def remove_yandex_duplicates():
 
     deleted_tracks = [t for t in delete if t['id'] in deleted_actual]
     deleted_list = [f"⚫ {t['artists']} - {t['title']}" for t in deleted_tracks]
+    if failed_actual:
+        return False, f"Удалено: {len(deleted_actual)}. Не удалось удалить: {len(failed_actual)}. Повторите позже."
     return True, deleted_list
 
 
-def clear_stale_sync_lock():
-    """Clear the sync_in_progress flag if the lock is stale (over 1 hour old)."""
-    try:
-        lock_time = get_setting("sync_started_at")
-        if not lock_time:
-            set_setting("sync_in_progress", "0")
-            return
-        from datetime import datetime
-        lock_dt = datetime.strptime(lock_time, "%Y-%m-%d %H:%M:%S")
-        if (datetime.now() - lock_dt).total_seconds() > 3600:
-            logging.warning("Обнаружена устаревшая блокировка синхронизации. Сброс.")
-            set_setting("sync_in_progress", "0")
-            set_setting("sync_started_at", "")
-    except Exception:
-        set_setting("sync_in_progress", "0")
-
-
+@serialized
 def full_two_way_sync(progress_callback=None, pending_callback=None):
     """Execute complete two-way synchronization between Yandex Music and Spotify."""
-    if is_sync_running():
-        clear_stale_sync_lock()
-        if is_sync_running():
-            return "Синхронизация уже выполняется. Подождите."
-
-    try:
-        set_setting("sync_in_progress", "1")
-        from datetime import datetime
-        set_setting("sync_started_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-    except Exception:
-        pass
-
     try:
         res1 = sync_ym_to_sp(progress_callback, pending_callback)
         res2 = sync_sp_to_ym(progress_callback, pending_callback)
         result = f"{res1}\n{res2}"
     except Exception as e:
         logging.error(f"Ошибка при синхронизации: {e}")
-        result = f"Ошибка синхронизации: {e}"
-    finally:
-        try:
-            set_setting("sync_in_progress", "0")
-            set_setting("sync_started_at", "")
-        except Exception:
-            pass
+        set_setting("last_sync_result", f"Ошибка синхронизации: {e}")
+        raise
 
     try:
         from datetime import datetime

@@ -5,6 +5,7 @@ import logging
 import sqlite3
 from yandex_music import Client
 from config import YANDEX_MUSIC_TOKEN
+from sync_logic import DB_FILE, init_db, serialized
 
 logging.basicConfig(
     level=logging.INFO,
@@ -13,11 +14,14 @@ logging.basicConfig(
 )
 
 
+@serialized
 def wipe_yandex_music_likes():
     """Получает все лайкнутые треки из Яндекс Музыки, удаляет их и чистит таблицы БД."""
     if not YANDEX_MUSIC_TOKEN:
         logging.error("YANDEX_MUSIC_TOKEN не задан в .env")
         sys.exit(1)
+
+    init_db()
 
     logging.info("Подключение к API Яндекс Музыки...")
     ym_client = Client(YANDEX_MUSIC_TOKEN).init()
@@ -42,7 +46,7 @@ def wipe_yandex_music_likes():
         logging.info("Все лайкнутые треки удалены из Яндекс Музыки.")
 
     logging.info("Очистка таблиц базы данных SQLite...")
-    conn = sqlite3.connect("sync_data.db")
+    conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
 
     tables = ["yandex_cache", "mappings", "failed_syncs", "pending_syncs"]
@@ -56,4 +60,6 @@ def wipe_yandex_music_likes():
 
 
 if __name__ == "__main__":
+    if sys.argv[1:] != ["--confirm"]:
+        sys.exit("Удаляет ВСЕ лайки Яндекса. Остановите бота: иначе Spotify вернёт их при следующей синхронизации.\nДля подтверждения: python wipe_ym_likes.py --confirm")
     wipe_yandex_music_likes()
