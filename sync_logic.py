@@ -9,6 +9,7 @@ import logging
 import json
 import os
 import re
+from urllib.parse import urlsplit
 import unicodedata
 import time
 import sqlite3
@@ -573,6 +574,27 @@ def get_ym_client():
     if not YANDEX_MUSIC_TOKEN:
         return None
     return Client(YANDEX_MUSIC_TOKEN).init()
+
+
+@serialized
+def like_playlist_tracks(playlist_url):
+    """Add every available track from an own Yandex Music playlist to likes."""
+    parsed = urlsplit(playlist_url)
+    match = re.fullmatch(r"/users/([^/]+)/playlists/(\d+)/?", parsed.path)
+    if parsed.scheme != "https" or parsed.hostname != "music.yandex.ru" or not match:
+        raise ValueError("Пришлите ссылку вида https://music.yandex.ru/users/.../playlists/...")
+    client = get_ym_client()
+    if not client:
+        raise RuntimeError("YANDEX_MUSIC_TOKEN не настроен. Проверьте .env и выполните /health.")
+    playlist = client.users_playlists(match.group(2), match.group(1))
+    track_ids = list(dict.fromkeys(str(track.id) for track in playlist.fetch_tracks() if track and track.id))
+    if not track_ids:
+        return f"В плейлисте «{playlist.title or 'без названия'}» нет доступных треков."
+    for index in range(0, len(track_ids), 100):
+        _, error = api_call_with_retry(client.users_likes_tracks_add, track_ids[index:index + 100])
+        if error:
+            raise error
+    return f"Лайкнуто {len(track_ids)} трека из плейлиста «{playlist.title or 'без названия'}»."
 
 
 def get_sp_client():

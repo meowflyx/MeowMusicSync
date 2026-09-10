@@ -38,6 +38,23 @@ class SyncRegressionTests(unittest.TestCase):
             self.assertEqual(clear(), 1)
             self.assertEqual(clear(), 0)
 
+    def test_like_playlist_adds_unique_tracks_in_batches(self):
+        playlist = SimpleNamespace(title="Imported", fetch_tracks=lambda: [
+            SimpleNamespace(id=1), SimpleNamespace(id=2), SimpleNamespace(id=1), SimpleNamespace(id=None), SimpleNamespace(id=3)
+        ])
+        batches = []
+        client = SimpleNamespace(users_playlists=lambda kind, user_id: playlist,
+                                 users_likes_tracks_add=lambda ids: batches.append(ids))
+        with patch.object(sync, "get_ym_client", return_value=client):
+            self.assertEqual(sync.like_playlist_tracks("https://music.yandex.ru/users/me/playlists/42"),
+                             "Лайкнуто 3 трека из плейлиста «Imported».")
+        self.assertEqual(batches, [["1", "2", "3"]])
+
+    def test_like_playlist_rejects_untrusted_or_incomplete_link(self):
+        for url in ("https://example.org/users/me/playlists/42", "https://music.yandex.ru/playlist/42"):
+            with self.subTest(url=url), self.assertRaisesRegex(ValueError, "ссылку"):
+                sync.like_playlist_tracks(url)
+
     def test_auth_checks_missing_settings_before_oauth(self):
         import auth_spotify
         with patch.multiple(auth_spotify, SPOTIPY_CLIENT_ID="", SPOTIPY_CLIENT_SECRET=" "), patch.object(

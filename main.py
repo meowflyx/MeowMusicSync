@@ -22,7 +22,7 @@ from sync_logic import (
     get_blacklist, clear_blacklist, remove_spotify_duplicates,
     remove_yandex_duplicates, get_last_sync_info, is_sync_running,
     get_recent_logs, check_api_health, add_manual_mapping,
-    remove_from_blacklist
+    remove_from_blacklist, like_playlist_tracks
 )
 
 log_handler = TimedRotatingFileHandler('sync.log', when='midnight', interval=1, backupCount=7)
@@ -114,6 +114,7 @@ async def help_handler(message: Message):
         "/logs [n] - Последние n строк лога (по умолчанию 20)\n"
         "/health - Проверка доступности API\n"
         "/add_mapping <ym_id> <sp_id> - Ручное сопоставление треков"
+        "\n/like_playlist <ссылка> - Лайкнуть все треки из плейлиста Яндекс Музыки"
     )
 
 
@@ -359,6 +360,22 @@ async def add_mapping_handler(message: Message):
     await message.answer(f"🔗 Добавлен маппинг: YM {ym_id} ↔ SP {sp_id}")
 
 
+@dp.message(Command("like_playlist"))
+async def like_playlist_handler(message: Message):
+    """Like all tracks in the supplied Yandex Music playlist."""
+    if message.from_user.id != TG_ADMIN_ID:
+        return
+    args = message.text.split(maxsplit=1)
+    if len(args) != 2:
+        return await message.answer("Использование: /like_playlist https://music.yandex.ru/users/.../playlists/...")
+    await message.answer("🔄 Добавляю треки в «Мне нравится»...")
+    try:
+        result = await asyncio.get_running_loop().run_in_executor(None, like_playlist_tracks, args[1])
+        await message.answer(f"✅ {result}")
+    except Exception as error:
+        await message.answer(f"❌ {explain_error(error)}")
+
+
 @dp.callback_query(F.data.startswith("approve:"))
 async def approve_callback(callback: CallbackQuery):
     """Handle the inline callback query to approve a pending track match."""
@@ -413,7 +430,8 @@ async def main():
     """Start the scheduler for periodic sync and start Telegram bot polling."""
     await bot.set_my_commands([BotCommand(command=command, description=description) for command, description in [
         ("sync", "Синхронизировать в обе стороны"), ("pending", "Одобрить совпадения"),
-        ("status", "Статистика"), ("last_sync", "Последняя синхронизация"), ("help", "Все команды")]])
+        ("like_playlist", "Лайкнуть треки из плейлиста"), ("status", "Статистика"),
+        ("last_sync", "Последняя синхронизация"), ("help", "Все команды")]])
     
     scheduler = AsyncIOScheduler()
     scheduler.add_job(periodic_sync, 'interval', hours=3)
