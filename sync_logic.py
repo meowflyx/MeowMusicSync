@@ -12,6 +12,7 @@ import re
 import unicodedata
 import time
 import sqlite3
+from error_messages import explain_error
 import fcntl
 import threading
 from contextlib import contextmanager
@@ -19,11 +20,13 @@ from functools import wraps
 from collections import deque
 from yandex_music import Client
 import spotipy
+from spotipy.exceptions import SpotifyException, SpotifyOauthError
+from yandex_music.exceptions import UnauthorizedError, BadRequestError, NotFoundError
 from spotipy.oauth2 import SpotifyOAuth
 from fuzzywuzzy import fuzz
 from config import (
     SPOTIPY_CLIENT_ID, SPOTIPY_CLIENT_SECRET, SPOTIPY_REDIRECT_URI,
-    YANDEX_MUSIC_TOKEN
+    YANDEX_MUSIC_TOKEN, validate_spotify_config
 )
 
 DB_FILE = "sync_data.db"
@@ -498,7 +501,7 @@ def check_api_health():
         else:
             result["yandex_error"] = "Токен не настроен"
     except Exception as e:
-        result["yandex_error"] = str(e)
+        result["yandex_error"] = explain_error(e)
     
     try:
         sp_client = get_sp_client()
@@ -508,7 +511,7 @@ def check_api_health():
         else:
             result["spotify_error"] = "Учётные данные не настроены"
     except Exception as e:
-        result["spotify_error"] = str(e)
+        result["spotify_error"] = explain_error(e)
     
     return result
 
@@ -574,8 +577,7 @@ def get_ym_client():
 
 def get_sp_client():
     """Initialize and return the Spotify API client using OAuth."""
-    if not SPOTIPY_CLIENT_ID or not SPOTIPY_CLIENT_SECRET or not SPOTIPY_REDIRECT_URI:
-        return None
+    validate_spotify_config(SPOTIPY_CLIENT_ID, SPOTIPY_CLIENT_SECRET, SPOTIPY_REDIRECT_URI)
     auth_manager = SpotifyOAuth(
         client_id=SPOTIPY_CLIENT_ID,
         client_secret=SPOTIPY_CLIENT_SECRET,
@@ -594,6 +596,10 @@ def api_call_with_retry(func, *args, max_retries=3, base_delay=2, **kwargs):
         try:
             return func(*args, **kwargs), None
         except Exception as e:
+            if isinstance(e, (SpotifyOauthError, UnauthorizedError, BadRequestError, NotFoundError)) or (
+                isinstance(e, SpotifyException) and 400 <= e.http_status < 500 and e.http_status != 429
+            ):
+                return None, RuntimeError(explain_error(e))
             if attempt == max_retries - 1:
                 return None, e
             delay = base_delay * (2 ** attempt)
@@ -1177,7 +1183,7 @@ def approve_pending(pend_key):
         _, err = api_call_with_retry(ym_client.users_likes_tracks_add, track_ids=[found_id])
         if err:
             conn.close()
-            return False, f"Ошибка при добавлении в Яндекс: {err}"
+            return False, explain_error(err)
         cursor.execute("DELETE FROM yandex_cache WHERE id = ?", (found_id,))
         if source_id:
             cursor.execute("INSERT OR IGNORE INTO mappings (ym_id, sp_id) VALUES (?, ?)", (found_id, source_id))
@@ -1190,7 +1196,7 @@ def approve_pending(pend_key):
         _, err = api_call_with_retry(sp_client.current_user_saved_tracks_add, tracks=[found_id])
         if err:
             conn.close()
-            return False, f"Ошибка при добавлении в Spotify: {err}"
+            return False, explain_error(err)
         cursor.execute("DELETE FROM spotify_cache WHERE id = ?", (found_id,))
         if source_id:
             cursor.execute("INSERT OR IGNORE INTO mappings (ym_id, sp_id) VALUES (?, ?)", (source_id, found_id))
@@ -1289,7 +1295,7 @@ def remove_spotify_duplicates():
                 break
     except Exception as e:
         logging.error(f"Ошибка при получении треков Spotify: {e}")
-        return False, f"Ошибка API Spotify: {e}"
+        return False, explain_error(e)
         
     if not tracks:
         return True, "Библиотека Spotify пуста."
@@ -1359,7 +1365,7 @@ def remove_yandex_duplicates():
         likes = ym_client.users_likes_tracks()
     except Exception as e:
         logging.error(f"Ошибка при получении лайков YM: {e}")
-        return False, f"Ошибка API Яндекс Музыки: {e}"
+        return False, explain_error(e)
         
     if not likes or not likes.tracks:
         return True, "Библиотека Яндекс Музыки пуста."
@@ -1477,7 +1483,7 @@ def full_two_way_sync():
         result = f"{res1}\n{res2}"
     except Exception as e:
         logging.error(f"Ошибка при синхронизации: {e}")
-        set_setting("last_sync_result", f"Ошибка синхронизации: {e}")
+        set_setting("last_sync_result", explain_error(e))
         raise
 
     try:

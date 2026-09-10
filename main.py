@@ -7,7 +7,9 @@ and viewing statistics, all backed by an SQLite database.
 import asyncio
 import logging
 import sys
+from error_messages import explain_error
 from aiogram import Bot, Dispatcher, F
+from aiogram.utils.token import TokenValidationError
 from aiogram.filters import Command, CommandObject
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, BotCommand, ErrorEvent
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -31,8 +33,12 @@ if not TG_BOT_TOKEN or not TG_ADMIN_ID:
     logging.error("Задайте TG_BOT_TOKEN и числовой TG_ADMIN_ID в .env.")
     sys.exit(1)
 
-bot = Bot(token=TG_BOT_TOKEN)
+try:
+    bot = Bot(token=TG_BOT_TOKEN)
+except TokenValidationError:
+    sys.exit("Неверный формат TG_BOT_TOKEN. Скопируйте токен бота из @BotFather в .env.")
 dp = Dispatcher()
+_last_background_error = None
 
 
 async def send_long_message(message: Message, header: str, lines: list, chunk_limit: int = 4000):
@@ -58,18 +64,22 @@ async def send_long_message(message: Message, header: str, lines: list, chunk_li
 
 async def periodic_sync():
     """Background task to run two-way sync periodically."""
+    global _last_background_error
     try:
         if is_sync_running():
             return
         loop = asyncio.get_running_loop()
         res = await loop.run_in_executor(None, full_two_way_sync)
+        _last_background_error = None
         logging.info(f"Фоновая синхронизация завершена:\n{res}")
         if TG_ADMIN_ID:
             await bot.send_message(TG_ADMIN_ID, f"🔄 Фоновая синхронизация завершена:\n{res}\nОдобрения: /pending", disable_notification=True)
     except Exception as e:
         logging.error(f"Ошибка фоновой синхронизации: {e}")
-        if TG_ADMIN_ID:
-            await bot.send_message(TG_ADMIN_ID, f"❌ Ошибка фоновой синхронизации: {e}")
+        error = explain_error(e)
+        if TG_ADMIN_ID and error != _last_background_error:
+            await bot.send_message(TG_ADMIN_ID, f"❌ Ошибка фоновой синхронизации: {error}")
+            _last_background_error = error
 
 
 @dp.message(Command("start"))
@@ -127,7 +137,7 @@ async def sync_handler(message: Message, command: CommandObject):
         await message.answer(f"✅ Готово:\n{res}\nОдобрения: /pending")
     except Exception as e:
         logging.error(f"Ошибка синхронизации {direction}: {e}")
-        await message.answer(f"❌ Ошибка: {e}")
+        await message.answer(f"❌ Ошибка: {explain_error(e)}")
 
 
 @dp.message(Command("status"))
@@ -389,7 +399,7 @@ async def handle_error(event: ErrorEvent):
     message = event.update.message or (event.update.callback_query.message if event.update.callback_query else None)
     user = event.update.message.from_user if event.update.message else (event.update.callback_query.from_user if event.update.callback_query else None)
     if message and user and user.id == TG_ADMIN_ID:
-        await message.answer(f"⚠️ Операция не завершена: {str(event.exception)[:500]}\nМожно повторить команду. /help")
+        await message.answer(f"⚠️ {explain_error(event.exception)}\n/help")
     return True
 
 
@@ -417,4 +427,9 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
+    except Exception as error:
+        sys.exit(explain_error(error))

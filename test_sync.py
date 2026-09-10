@@ -13,6 +13,8 @@ from unittest.mock import patch
 from contextlib import closing
 
 import sync_logic as sync
+from error_messages import explain_error
+from spotipy.exceptions import SpotifyException, SpotifyOauthError
 
 
 class SyncRegressionTests(unittest.TestCase):
@@ -35,6 +37,31 @@ class SyncRegressionTests(unittest.TestCase):
         for clear in (sync.clear_failed_tracks, sync.clear_blacklist):
             self.assertEqual(clear(), 1)
             self.assertEqual(clear(), 0)
+
+    def test_auth_checks_missing_settings_before_oauth(self):
+        import auth_spotify
+        with patch.multiple(auth_spotify, SPOTIPY_CLIENT_ID="", SPOTIPY_CLIENT_SECRET=" "), patch.object(
+            auth_spotify, "SpotifyOAuth", side_effect=AssertionError("OAuth must not start")
+        ):
+            with self.assertRaisesRegex(ValueError, "SPOTIPY_CLIENT_ID, SPOTIPY_CLIENT_SECRET"):
+                auth_spotify.main()
+
+    def test_permanent_spotify_failure_is_not_retried(self):
+        calls = []
+        def denied():
+            calls.append(1)
+            raise SpotifyException(403, -1, "Active premium subscription required for the owner of the app")
+        with patch.object(sync.time, "sleep", side_effect=AssertionError("must not retry")):
+            _, error = sync.api_call_with_retry(denied)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("Premium", str(error))
+
+    def test_error_messages_distinguish_access_and_auth_failures(self):
+        self.assertNotIn("требует Premium", explain_error(SpotifyException(403, -1, "Forbidden")))
+        self.assertIn("Users and Access", explain_error(SpotifyException(403, -1, "Forbidden")))
+        self.assertIn("Client ID / Client Secret", explain_error(SpotifyOauthError("secret", error="invalid_client")))
+        self.assertNotIn("secret", explain_error(SpotifyOauthError("secret", error="invalid_grant")))
+        self.assertIn("auth_spotify.py", explain_error(SpotifyException(401, -1, "Expired")))
 
     def test_versions_are_not_duplicates_even_with_similar_titles(self):
         self.assertFalse(sync.check_duplicate(
@@ -137,6 +164,17 @@ class BotRegressionTests(unittest.IsolatedAsyncioTestCase):
         import config
         with patch.object(config, "TG_BOT_TOKEN", "123456:offline_test_token"), patch.object(config, "TG_ADMIN_ID", 42), patch("logging.handlers.TimedRotatingFileHandler", return_value=logging.NullHandler()):
             cls.bot = importlib.import_module("main")
+
+    async def test_repeated_background_error_notifies_once(self):
+        sent = []
+        async def send(*args, **kw):
+            sent.append(args)
+        with patch.object(self.bot, "_last_background_error", None), patch.object(self.bot, "is_sync_running", return_value=False), patch.object(
+            self.bot, "full_two_way_sync", side_effect=RuntimeError("Premium required")
+        ), patch.object(self.bot.bot, "send_message", side_effect=send):
+            await self.bot.periodic_sync()
+            await self.bot.periodic_sync()
+        self.assertEqual(len(sent), 1)
 
     async def test_sync_commands_select_direction_and_reject_non_admin(self):
         sent = []

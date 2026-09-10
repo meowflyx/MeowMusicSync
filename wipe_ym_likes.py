@@ -6,6 +6,7 @@ import sqlite3
 from yandex_music import Client
 from config import YANDEX_MUSIC_TOKEN
 from sync_logic import DB_FILE, init_db, serialized
+from error_messages import explain_error
 
 logging.basicConfig(
     level=logging.INFO,
@@ -62,4 +63,9 @@ def wipe_yandex_music_likes():
 if __name__ == "__main__":
     if sys.argv[1:] != ["--confirm"]:
         sys.exit("Удаляет ВСЕ лайки Яндекса. Остановите бота: иначе Spotify вернёт их при следующей синхронизации.\nДля подтверждения: python wipe_ym_likes.py --confirm")
-    wipe_yandex_music_likes()
+    try:
+        wipe_yandex_music_likes()
+    except KeyboardInterrupt:
+        sys.exit("Удаление прервано. Часть лайков уже могла быть удалена.")
+    except Exception as error:
+        sys.exit(explain_error(error))

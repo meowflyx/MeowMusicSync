@@ -9,6 +9,16 @@
 
 ## Установка и запуск
 
+Для собственного Spotify-приложения в Development Mode нужен активный Premium
+у владельца приложения. При 403 с требованием Premium перевыпуск токена не помогает.
+Для разового переноса сначала попробуйте https://music.yandex.ru/import.
+Правила Spotify: https://developer.spotify.com/documentation/web-api/concepts/quota-modes
+
+`auth_spotify.py` проверяет обязательные настройки до OAuth. Ошибки авторизации,
+доступа, сети и лимитов объясняются в CLI и боте. Одинаковая фоновая ошибка
+сообщается один раз до успешного прохода, изменения ошибки или перезапуска;
+повторную диагностику можно вызвать через `/health`.
+
 1. Склонируйте репозиторий:
    ```bash
    git clone https://github.com/meowflyx/MeowMusicSync.git
