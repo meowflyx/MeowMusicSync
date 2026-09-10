@@ -50,6 +50,13 @@ class SyncRegressionTests(unittest.TestCase):
                              "Лайкнуто 3 трека из плейлиста «Imported».")
         self.assertEqual(batches, [["1", "2", "3"]])
 
+    def test_like_playlist_accepts_uuid_share_link(self):
+        playlist = SimpleNamespace(title="Imported", fetch_tracks=lambda: [SimpleNamespace(id=1)])
+        client = SimpleNamespace(playlist=lambda uuid: playlist,
+                                 users_likes_tracks_add=lambda ids: None)
+        with patch.object(sync, "get_ym_client", return_value=client):
+            self.assertIn("1 трека", sync.like_playlist_tracks("https://music.yandex.ru/playlists/4b0aed49-e9be-1252-9501-e2e322904d6b?utm_source=desktop"))
+
     def test_like_playlist_rejects_untrusted_or_incomplete_link(self):
         for url in ("https://example.org/users/me/playlists/42", "https://music.yandex.ru/playlist/42"):
             with self.subTest(url=url), self.assertRaisesRegex(ValueError, "ссылку"):

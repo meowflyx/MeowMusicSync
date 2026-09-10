@@ -581,12 +581,13 @@ def like_playlist_tracks(playlist_url):
     """Add every available track from an own Yandex Music playlist to likes."""
     parsed = urlsplit(playlist_url)
     match = re.fullmatch(r"/users/([^/]+)/playlists/(\d+)/?", parsed.path)
-    if parsed.scheme != "https" or parsed.hostname != "music.yandex.ru" or not match:
-        raise ValueError("Пришлите ссылку вида https://music.yandex.ru/users/.../playlists/...")
+    uuid_match = re.fullmatch(r"/playlists/([0-9a-f-]{36})/?", parsed.path, re.IGNORECASE)
+    if parsed.scheme != "https" or parsed.hostname != "music.yandex.ru" or not (match or uuid_match):
+        raise ValueError("Пришлите ссылку Яндекс Музыки вида https://music.yandex.ru/playlists/... или https://music.yandex.ru/users/.../playlists/...")
     client = get_ym_client()
     if not client:
         raise RuntimeError("YANDEX_MUSIC_TOKEN не настроен. Проверьте .env и выполните /health.")
-    playlist = client.users_playlists(match.group(2), match.group(1))
+    playlist = client.playlist(uuid_match.group(1)) if uuid_match else client.users_playlists(match.group(2), match.group(1))
     track_ids = list(dict.fromkeys(str(track.id) for track in playlist.fetch_tracks() if track and track.id))
     if not track_ids:
         return f"В плейлисте «{playlist.title or 'без названия'}» нет доступных треков."

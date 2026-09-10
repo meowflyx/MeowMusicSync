@@ -367,7 +367,7 @@ async def like_playlist_handler(message: Message):
         return
     args = message.text.split(maxsplit=1)
     if len(args) != 2:
-        return await message.answer("Использование: /like_playlist https://music.yandex.ru/users/.../playlists/...")
+        return await message.answer("Использование: /like_playlist <ссылка на плейлист Яндекс Музыки>")
     await message.answer("🔄 Добавляю треки в «Мне нравится»...")
     try:
         result = await asyncio.get_running_loop().run_in_executor(None, like_playlist_tracks, args[1])
