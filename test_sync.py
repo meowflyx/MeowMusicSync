@@ -13,6 +13,8 @@ from unittest.mock import patch
 from contextlib import closing
 
 import sync_logic as sync
+from candidate_search import discover_spotify, discover_yandex
+from matching import Track, metadata_features
 from error_messages import explain_error
 from spotipy.exceptions import SpotifyException, SpotifyOauthError
 
@@ -32,11 +34,20 @@ class SyncRegressionTests(unittest.TestCase):
 
     def test_clear_returns_deleted_count(self):
         with closing(sqlite3.connect(sync.DB_FILE)) as db, db:
-            db.execute("INSERT INTO failed_syncs VALUES ('x', 'song')")
-            db.execute("INSERT INTO blacklist VALUES ('1', 'a', 'artist', 'song')")
-        for clear in (sync.clear_failed_tracks, sync.clear_blacklist):
-            self.assertEqual(clear(), 1)
-            self.assertEqual(clear(), 0)
+            db.execute("INSERT INTO failed_syncs (key, query) VALUES ('x', 'song')")
+        self.assertEqual(sync.clear_failed_tracks(), 1)
+        self.assertEqual(sync.clear_failed_tracks(), 0)
+
+    def test_legacy_blacklist_is_removed_during_migration(self):
+        with closing(sqlite3.connect(sync.DB_FILE)) as db, db:
+            db.execute("CREATE TABLE blacklist (ym_id TEXT, sp_id TEXT)")
+            db.execute("INSERT INTO blacklist VALUES ('old', 'old')")
+            db.execute("PRAGMA user_version = 2")
+        sync.init_db()
+        with closing(sqlite3.connect(sync.DB_FILE)) as db:
+            self.assertIsNone(db.execute(
+                "SELECT name FROM sqlite_master WHERE name = 'blacklist'"
+            ).fetchone())
 
     def test_like_playlist_adds_unique_tracks_in_batches(self):
         playlist = SimpleNamespace(title="Imported", fetch_tracks=lambda: [
@@ -92,6 +103,35 @@ class SyncRegressionTests(unittest.TestCase):
             {"artists": "Artist", "title": "A very long song title about our beautiful world"},
             {"artists": "Artist", "title": "A very long song title about our beautiful world - Live"}))
 
+    def test_spotify_duplicate_cleanup_uses_current_metadata_and_removes_mapping(self):
+        def item(id, added_at):
+            return {"added_at": added_at, "track": {"id": id, "name": "Song",
+                    "artists": [{"name": "Artist"}], "duration_ms": 180000}}
+        deleted = []
+        client = SimpleNamespace(
+            current_user_saved_tracks=lambda **kw: {"items": [item("new", "2026-09-02"),
+                                                          item("old", "2026-09-01")], "next": None},
+            current_user_saved_tracks_delete=lambda **kw: deleted.extend(kw["tracks"]))
+        with closing(sqlite3.connect(sync.DB_FILE)) as db, db:
+            db.execute("INSERT INTO mappings (ym_id, sp_id) VALUES ('ym', 'old')")
+        with patch.object(sync, "get_sp_client", return_value=client):
+            self.assertTrue(sync.remove_spotify_duplicates()[0])
+        self.assertEqual(deleted, ["old"])
+        with closing(sqlite3.connect(sync.DB_FILE)) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM mappings").fetchone()[0], 0)
+
+    def test_yandex_duplicate_cleanup_uses_current_metadata(self):
+        deleted = []
+        client = SimpleNamespace(users_likes_tracks_remove=lambda ids: deleted.extend(ids))
+        tracks = [{"id": "new", "artists": "Artist", "title": "Song",
+                   "duration_ms": 180000, "timestamp": "2026-09-02"},
+                  {"id": "old", "artists": "Artist", "title": "Song",
+                   "duration_ms": 180000, "timestamp": "2026-09-01"}]
+        with patch.object(sync, "get_ym_client", return_value=client), \
+             patch.object(sync, "get_ym_likes", return_value=tracks):
+            self.assertTrue(sync.remove_yandex_duplicates()[0])
+        self.assertEqual(deleted, ["old"])
+
     def test_missing_spotify_track_does_not_abort_library(self):
         client = SimpleNamespace(current_user_saved_tracks=lambda **kw: {
             "items": [{"track": None}, {"track": {"id": "abc", "artists": [{"name": "Artist"}], "name": "Song"}}],
@@ -102,21 +142,20 @@ class SyncRegressionTests(unittest.TestCase):
         def unavailable(*args, **kwargs):
             raise ConnectionError("offline")
         with patch.object(sync.time, "sleep"):
-            for fn, client in [(sync.match_track_spotify, SimpleNamespace(search=unavailable)),
-                               (sync.match_track_yandex, SimpleNamespace(search=unavailable))]:
+            for fn, client in [(discover_spotify, SimpleNamespace(search=unavailable)),
+                               (discover_yandex, SimpleNamespace(search=unavailable))]:
                 with self.subTest(fn=fn.__name__), self.assertRaises(ConnectionError):
-                    fn("Artist", "Song", client)
+                    fn(Track("yandex", "1", "Song", ("Artist",)), client)
 
     def test_approval_does_not_cache_empty_metadata(self):
         with closing(sqlite3.connect(sync.DB_FILE)) as db, db:
-            db.execute("INSERT INTO pending_syncs VALUES (?, ?, ?, ?, ?, ?)",
+            db.execute("INSERT INTO pending_syncs (key, direction, source, found, found_id, score) VALUES (?, ?, ?, ?, ?, ?)",
                        ("ym_to_sp:1", "ym_to_sp", "Artist Song", "Artist Song", "abc", 80))
         client = SimpleNamespace(current_user_saved_tracks_add=lambda **kw: None)
         with patch.object(sync, "get_sp_client", return_value=client):
             self.assertTrue(sync.approve_pending("ym_to_sp:1")[0])
         with closing(sqlite3.connect(sync.DB_FILE)) as db, db:
-            self.assertEqual(db.execute("SELECT * FROM spotify_cache").fetchall(), [])
-            self.assertEqual(db.execute("SELECT * FROM mappings").fetchall(), [("1", "abc")])
+            self.assertEqual(db.execute("SELECT ym_id, sp_id FROM mappings").fetchall(), [("1", "abc")])
 
     def test_mutations_exclude_other_threads_and_processes(self):
         entered, release = threading.Event(), threading.Event()
@@ -159,9 +198,72 @@ class SyncRegressionTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             sync.get_ym_likes(client)
 
+    def test_yandex_likes_keep_original_artist_and_cover_version(self):
+        original = SimpleNamespace(id="1", artists=[SimpleNamespace(name="s0rrow")],
+                                   title="fake ur face", version=None)
+        replacement = SimpleNamespace(id="1", artists=[SimpleNamespace(name="vibermx")],
+                                      title="fake ur face", version=None, substituted=original)
+        cover = SimpleNamespace(id="2", artists=[SimpleNamespace(name="Torlin")],
+                                title="GOSSIP", version="Cover", substituted=None)
+        client = SimpleNamespace(users_likes_tracks=lambda: SimpleNamespace(tracks=[
+            SimpleNamespace(id="1", album_id=None), SimpleNamespace(id="2", album_id=None)]),
+            tracks=lambda ids: [replacement, cover])
+        tracks = sync.get_ym_likes(client)
+        self.assertEqual((tracks[0]['id'], tracks[0]['artists']), ("1", "s0rrow"))
+        self.assertEqual(tracks[1]['title'], "GOSSIP (Cover)")
+        self.assertEqual(sync.get_ym_likes(client), tracks)
+
+    def test_yandex_search_does_not_disguise_replacement_as_original(self):
+        original = SimpleNamespace(artists=[SimpleNamespace(name="s0rrow")], title="fake ur face", version=None)
+        replacement = SimpleNamespace(id="1", artists=[SimpleNamespace(name="vibermx")],
+                                      title="fake ur face", version="Cover", substituted=original)
+        client = SimpleNamespace(search=lambda *a, **kw: SimpleNamespace(tracks=SimpleNamespace(results=[replacement])))
+        candidates = discover_yandex(Track("spotify", "sp", "fake ur face", ("s0rrow",)), client)
+        self.assertEqual(candidates[0].artists, ("vibermx",))
+        self.assertFalse(metadata_features(Track("spotify", "sp", "fake ur face", ("s0rrow",)),
+                                           candidates[0]).safe_exact)
+
+    def test_migration_drops_stale_cache_and_likes_fetch_fresh_metadata(self):
+        with closing(sqlite3.connect(sync.DB_FILE)) as db, db:
+            db.execute("CREATE TABLE yandex_cache (id TEXT, artists TEXT, title TEXT, query TEXT)")
+            db.execute("INSERT INTO yandex_cache VALUES ('1', 'vibermx', 'fake ur face', 'old')")
+            db.execute("PRAGMA user_version = 1")
+        sync.init_db()
+        with closing(sqlite3.connect(sync.DB_FILE)) as db:
+            self.assertIsNone(db.execute("SELECT name FROM sqlite_master WHERE name = 'yandex_cache'").fetchone())
+        actual = SimpleNamespace(id="1", artists=[SimpleNamespace(name="s0rrow")],
+                                 title="fake ur face", version=None)
+        client = SimpleNamespace(users_likes_tracks=lambda: SimpleNamespace(tracks=[
+            SimpleNamespace(id="1", album_id=None)]), tracks=lambda ids: [actual])
+        self.assertEqual(sync.get_ym_likes(client)[0]["artists"], "s0rrow")
+
     def test_fuzzy_existing_match_preserves_version(self):
-        self.assertIsNone(sync.find_already_present_id("Artist", "Song - Remix", [
-            {"id": "1", "artists": "Artist", "title": "Song"}]))
+        self.assertFalse(metadata_features(Track("yandex", "1", "Song - Remix", ("Artist",)),
+                                           Track("spotify", "2", "Song", ("Artist",))).safe_exact)
+
+    def test_catalog_title_annotations_and_artist_mismatch(self):
+        for artist, left, right in [
+            ("KEYGEN CHURCH", "Tenebre Rosso Sangue", "Tenebre Rosso Sangue (ULTRAKILL Original Game Soundtrack)"),
+            ("MORGENSHTERN", "Yung Hefner ROCK REMIX", "Yung Hefner - ROCK REMIX"),
+        ]:
+            with self.subTest(title=left):
+                self.assertGreater(metadata_features(Track("yandex", "1", left, (artist,)),
+                                                     Track("spotify", "2", right, (artist,))).rank, 50)
+        self.assertFalse(metadata_features(Track("yandex", "1", "fake ur face", ("vibermx",)),
+                                           Track("spotify", "2", "fake ur face", ("s0rrow",))).safe_exact)
+        self.assertFalse(metadata_features(Track("yandex", "1", "Song", ("Artist",)),
+                                           Track("spotify", "2", "Song - Rock Remix", ("Artist",))).safe_exact)
+
+    def test_existing_spotify_candidate_with_different_artist_needs_approval(self):
+        source = {"id": "ym", "artists": "vibermx", "title": "fake ur face", "search_query": "vibermx fake ur face"}
+        target = {"id": "sp", "artists": "s0rrow", "title": "fake ur face"}
+        client = SimpleNamespace(search=lambda **kw: {"tracks": {"items": []}})
+        with patch.object(sync, "get_ym_client", return_value=object()), patch.object(sync, "get_sp_client", return_value=client), \
+             patch.object(sync, "get_ym_likes", return_value=[source]), patch.object(sync, "get_sp_likes", return_value=[target]):
+            self.assertIn("на одобрении 1", sync.sync_ym_to_sp())
+        self.assertEqual(sync.get_pending_tracks()["ym_to_sp:ym"]["found_id"], "sp")
+        with closing(sqlite3.connect(sync.DB_FILE)) as db:
+            self.assertEqual(db.execute("SELECT * FROM mappings").fetchall(), [])
 
     def test_health_reports_client_initialization_failure(self):
         with patch.object(sync, "get_ym_client", side_effect=ValueError("bad token")), patch.object(sync, "get_sp_client", return_value=None):
@@ -216,6 +318,23 @@ class BotRegressionTests(unittest.IsolatedAsyncioTestCase):
             message.from_user.id = 99
             await self.bot.sync_handler(message, SimpleNamespace(command="sync"))
             self.assertEqual(sent, [])
+
+    async def test_jev_key_message_is_deleted_and_never_echoed(self):
+        sent = []
+        deleted = []
+        async def answer(text, **kw):
+            sent.append(text)
+        async def delete():
+            deleted.append(True)
+        message = SimpleNamespace(from_user=SimpleNamespace(id=42), chat=SimpleNamespace(type="private"),
+                                  text="/jev openrouter private-key", answer=answer, delete=delete)
+        with patch.object(self.bot, "configure_jev") as configure, patch.object(
+            self.bot, "get_jev_status", return_value={"enabled": True, "provider": "openrouter", "configured": True}
+        ):
+            await self.bot.jev_handler(message)
+        self.assertEqual(deleted, [True])
+        configure.assert_called_once_with("openrouter", "private-key")
+        self.assertNotIn("private-key", " ".join(sent))
 
     async def test_long_lines_and_emoji_fit_telegram_limit(self):
         sent = []

@@ -50,7 +50,7 @@ def wipe_yandex_music_likes():
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
 
-    tables = ["yandex_cache", "mappings", "failed_syncs", "pending_syncs"]
+    tables = ["mappings", "failed_syncs", "pending_syncs"]
     for table in tables:
         cursor.execute(f"DELETE FROM {table}")
         logging.info(f"Очищена таблица '{table}'.")

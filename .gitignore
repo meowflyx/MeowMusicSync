@@ -1,4 +1,5 @@
 .env
+.jev.key
 .cache*
 manifest.json
 manifest.json.bak

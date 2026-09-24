@@ -19,10 +19,12 @@ from sync_logic import (
     sync_ym_to_sp, sync_sp_to_ym, full_two_way_sync,
     approve_pending, reject_pending, get_status_stats,
     get_pending_tracks, clear_failed_tracks, get_failed_tracks,
-    get_blacklist, clear_blacklist, remove_spotify_duplicates,
+    remove_spotify_duplicates,
     remove_yandex_duplicates, get_last_sync_info, is_sync_running,
     get_recent_logs, check_api_health, add_manual_mapping,
-    remove_from_blacklist, like_playlist_tracks
+    like_playlist_tracks,
+    configure_jev, set_jev_enabled, get_jev_status,
+    set_matching_mode, revalidate_mappings
 )
 
 log_handler = TimedRotatingFileHandler('sync.log', when='midnight', interval=1, backupCount=7)
@@ -103,11 +105,8 @@ async def help_handler(message: Message):
         "/sync_sp_ym - Spotify → Яндекс\n"
         "/status - Статистика\n"
         "/pending [страница] - Одобрения, по 5 треков\n"
-        "/retry_failed - Очистить кэш ненайденных\n"
+        "/retry_failed - Повторить ненайденные треки\n"
         "/list_failed - Список ненайденных\n"
-        "/blacklist - Показать блеклист\n"
-        "/clear_blacklist - Очистить блеклист\n"
-        "/unblacklist <ym_id|sp_id> - Удалить один трек из блеклиста\n"
         "/clean_sp_dupes - Удалить дубликаты из Spotify (с подтверждением)\n"
         "/clean_ym_dupes - Удалить дубликаты из Яндекс Музыки (с подтверждением)\n"
         "/last_sync - Информация о последней синхронизации\n"
@@ -115,7 +114,77 @@ async def help_handler(message: Message):
         "/health - Проверка доступности API\n"
         "/add_mapping <ym_id> <sp_id> - Ручное сопоставление треков"
         "\n/like_playlist <ссылка> - Лайкнуть все треки из плейлиста Яндекс Музыки"
+        "\n/jev - Настроить проверку совпадений Jev"
+        "\n/matching [hybrid|jev_only] - Режим сопоставления"
+        "\n/revalidate - Переоценить сохранённые сопоставления"
     )
+
+
+@dp.message(Command("jev"))
+async def jev_handler(message: Message):
+    """Configure optional Jev verification without exposing the key in replies."""
+    if message.from_user.id != TG_ADMIN_ID:
+        return
+    parts = (message.text or "").split(maxsplit=2)
+    action = parts[1].lower() if len(parts) > 1 else "status"
+    if action in ("typesafe", "openrouter", "vercel"):
+        if len(parts) != 3:
+            return await message.answer("Использование: /jev typesafe|openrouter|vercel <API-ключ>")
+        try:
+            await message.delete()
+            deleted = True
+        except Exception:
+            deleted = False
+        if message.chat.type != "private":
+            return await message.answer("Настройте Jev в личном чате с ботом." + (" Удалите сообщение с ключом вручную." if not deleted else ""))
+        try:
+            await asyncio.get_running_loop().run_in_executor(None, configure_jev, action, parts[2])
+        except (ValueError, RuntimeError) as exc:
+            return await message.answer(f"❌ {exc}" + (" Удалите сообщение с ключом вручную." if not deleted else ""))
+        return await message.answer(f"✅ Jev включён через {action}." + (" Удалите сообщение с ключом вручную." if not deleted else ""))
+    if action in ("on", "off"):
+        try:
+            await asyncio.get_running_loop().run_in_executor(None, set_jev_enabled, action == "on")
+        except (ValueError, RuntimeError) as exc:
+            return await message.answer(f"❌ {exc}")
+    elif action != "status":
+        return await message.answer("Использование: /jev [status|on|off|typesafe <ключ>|openrouter <ключ>|vercel <ключ>]")
+    status = get_jev_status()
+    await message.answer(
+        f"Jev: {'включён' if status['enabled'] else 'выключен'}; "
+        f"провайдер: {status['provider'] or 'не выбран'}; "
+        f"ключ: {'сохранён' if status['configured'] else 'не задан'}; "
+        f"режим: {status['mode']}.\n"
+        "Настройка: /jev typesafe|openrouter|vercel <ключ>; управление: /jev on, /jev off."
+    )
+
+
+@dp.message(Command("matching"))
+async def matching_handler(message: Message):
+    if message.from_user.id != TG_ADMIN_ID:
+        return
+    args = (message.text or "").split()
+    if len(args) == 1:
+        return await message.answer(f"Режим: {get_jev_status()['mode']}. /matching hybrid|jev_only")
+    if len(args) != 2:
+        return await message.answer("Использование: /matching hybrid|jev_only")
+    try:
+        await asyncio.get_running_loop().run_in_executor(None, set_matching_mode, args[1])
+    except (ValueError, RuntimeError) as error:
+        return await message.answer(f"❌ {error}")
+    await message.answer(f"Режим сопоставления: {args[1]}. Сохранённые пары будут переоценены при синхронизации.")
+
+
+@dp.message(Command("revalidate"))
+async def revalidate_handler(message: Message):
+    if message.from_user.id != TG_ADMIN_ID:
+        return
+    await message.answer("🔄 Переоцениваю сохранённые пары...")
+    try:
+        result = await asyncio.get_running_loop().run_in_executor(None, revalidate_mappings)
+    except Exception as error:
+        return await message.answer(f"❌ {explain_error(error)}")
+    await message.answer(f"✅ {result}\nПроверьте /pending")
 
 
 @dp.message(Command("sync_all", "sync", "sync_ym_sp", "sync_sp_ym"))
@@ -149,8 +218,6 @@ async def status_handler(message: Message):
     stats = get_status_stats()
     await message.answer(
         f"📊 Статистика:\n"
-        f"Яндекс в кэше: {stats['yandex']}\n"
-        f"Spotify в кэше: {stats['spotify']}\n"
         f"🔗 Сопоставлено треков: {stats['mappings']}\n"
         f"⏳ Ожидают одобрения: {stats['pending']}\n"
         f"❌ Не найдено: {stats['failed']}"
@@ -175,11 +242,35 @@ async def pending_handler(message: Message):
         return await message.answer(f"Всего страниц: {pages}. Начать: /pending")
     for key, entry in list(pending.items())[(page - 1) * 5:page * 5]:
         arrow = "🟡 YM → SP" if entry["direction"] == "ym_to_sp" else "🔵 SP → YM"
+        score_label = (f"Jev: {entry['jev_probability']:.1%}; " if entry.get('jev_probability') is not None else "")
+        score_label += (f"Ранг метаданных: {entry['metadata_rank']:.1f}/100" if entry.get('metadata_rank') is not None
+                        else "Старая оценка: источник не сохранён")
+        reason_labels = {
+            "version_markers_differ": "разные версии записи",
+            "artists_differ": "разный состав артистов",
+            "isrc_conflict": "разные ISRC",
+            "isrc_equal": "одинаковый ISRC",
+            "duration_conflict": "большая разница длительности",
+            "duration_differs": "разница длительности",
+            "title_equal": "названия совпали",
+            "jev_rejected": "Jev отверг пару",
+            "jev_close_candidates": "несколько близких кандидатов",
+            "mapping_conflict": "ID уже связан с другой парой",
+        }
+        details = ", ".join(reason_labels.get(reason, reason) for reason in
+                            (entry.get('reasons') or ())) or "нет подробностей"
+        candidates = "\n".join(
+            f"• {item.get('label', item['id'])[:100]}: ранг {item['rank']:.0f}"
+            + (f", Jev {item['jev']:.1%}" if item.get('jev') is not None else "")
+            for item in (entry.get('diagnostics') or [])[:3]
+        )
         text = (
-            f"⏳ Одобрение ({entry['score']}%)\n"
+            f"⏳ {'Проверка старой пары' if entry.get('purpose') == 'revalidate' else 'Одобрение'}\n"
+            f"Режим: {entry.get('mode') or 'legacy'}; {score_label}\nПричины: {details}\n"
             f"{arrow}\n\n"
             f"🔍 Искали: {entry['source'][:700]}\n"
             f"📀 Нашли: {entry['found'][:700]}"
+            + (f"\nКандидаты:\n{candidates}" if candidates else "")
         )
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [
@@ -217,44 +308,6 @@ async def list_failed_handler(message: Message):
         lines.append(f"{direction}: {query}")
     
     await send_long_message(message, "📋 Ненайденные:", lines)
-
-
-@dp.message(Command("blacklist"))
-async def blacklist_handler(message: Message):
-    """List all tracks currently blacklisted."""
-    if message.from_user.id != TG_ADMIN_ID:
-        return
-    bl = get_blacklist()
-    if not bl:
-        return await message.answer("Блеклист пуст.")
-    
-    lines = [f"⚫ {item['artists']} - {item['title']} (YM: {item['ym_id']}, SP: {item['sp_id']})" for item in bl]
-    await send_long_message(message, "📋 Блеклист:", lines)
-
-
-@dp.message(Command("clear_blacklist"))
-async def clear_blacklist_handler(message: Message):
-    """Clear all tracks from the blacklist."""
-    if message.from_user.id != TG_ADMIN_ID:
-        return
-    count = clear_blacklist()
-    await message.answer(f"🗑 Блеклист очищен. Удалено {count} записей.")
-
-
-@dp.message(Command("unblacklist"))
-async def unblacklist_handler(message: Message):
-    """Remove a single track from the blacklist by ym_id or sp_id."""
-    if message.from_user.id != TG_ADMIN_ID:
-        return
-    args = message.text.split()[1:]
-    if not args:
-        return await message.answer("Использование: /unblacklist <ym_id|sp_id>")
-    track_id = args[0]
-    count = remove_from_blacklist(ym_id=track_id) or remove_from_blacklist(sp_id=track_id)
-    if count:
-        await message.answer(f"🗑 Удалено из блеклиста: {count} записей.")
-    else:
-        await message.answer("Трек не найден в блеклисте.")
 
 
 @dp.message(Command("clean_sp_dupes"))
@@ -356,7 +409,10 @@ async def add_mapping_handler(message: Message):
     if len(args) != 2:
         return await message.answer("Использование: /add_mapping <ym_id> <sp_id>")
     ym_id, sp_id = args
-    add_manual_mapping(ym_id, sp_id)
+    try:
+        add_manual_mapping(ym_id, sp_id)
+    except ValueError as error:
+        return await message.answer(f"❌ {error}")
     await message.answer(f"🔗 Добавлен маппинг: YM {ym_id} ↔ SP {sp_id}")
 
 
@@ -431,7 +487,9 @@ async def main():
     await bot.set_my_commands([BotCommand(command=command, description=description) for command, description in [
         ("sync", "Синхронизировать в обе стороны"), ("pending", "Одобрить совпадения"),
         ("like_playlist", "Лайкнуть треки из плейлиста"), ("status", "Статистика"),
-        ("last_sync", "Последняя синхронизация"), ("help", "Все команды")]])
+        ("last_sync", "Последняя синхронизация"), ("jev", "Проверка совпадений Jev"),
+        ("matching", "Режим сопоставления"), ("revalidate", "Переоценить пары"),
+        ("help", "Все команды")]])
     
     scheduler = AsyncIOScheduler()
     scheduler.add_job(periodic_sync, 'interval', hours=3)
