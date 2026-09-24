@@ -36,6 +36,7 @@ from config import (
 )
 
 DB_FILE = "sync_data.db"
+CATALOG_SEARCH_INTERVAL_SECONDS = 10
 
 # ponytail: one account on one Linux host; distributed workers need a shared lock.
 _operation_lock = threading.RLock()
@@ -342,7 +343,8 @@ def get_sp_client():
     )
     if not auth_manager.validate_token(auth_manager.cache_handler.get_cached_token()):
         raise RuntimeError("Spotify не авторизован. Выполните .venv/bin/python auth_spotify.py на сервере.")
-    return spotipy.Spotify(auth_manager=auth_manager)
+    return spotipy.Spotify(auth_manager=auth_manager, retries=0, status_retries=0,
+                           status_forcelist=(500, 502, 503, 504))
 
 
 def api_call_with_retry(func, *args, max_retries=3, base_delay=2, **kwargs):
@@ -351,6 +353,8 @@ def api_call_with_retry(func, *args, max_retries=3, base_delay=2, **kwargs):
         try:
             return func(*args, **kwargs), None
         except Exception as e:
+            if isinstance(e, SpotifyException) and e.http_status == 429:
+                return None, e
             if isinstance(e, (SpotifyOauthError, UnauthorizedError, BadRequestError, NotFoundError)) or (
                 isinstance(e, SpotifyException) and 400 <= e.http_status < 500 and e.http_status != 429
             ):
@@ -465,11 +469,13 @@ def _sync_direction(direction: str) -> str:
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
     added = pending_count = failed_count = skipped = 0
+    last_catalog_search = None
     revalidate = get_setting("matching_revalidate") == "1"
     try:
         mappings = {row[0]: (row[1], row[2]) for row in conn.execute(
             "SELECT ym_id, sp_id, algorithm_version FROM mappings" if source_is_yandex
             else "SELECT sp_id, ym_id, algorithm_version FROM mappings")}
+        claimed_target_ids = {target_id for target_id, _ in mappings.values()}
         failed = {row[0]: (row[1], row[2]) for row in conn.execute(
             "SELECT key, algorithm_version, mode FROM failed_syncs WHERE key LIKE ?",
             (direction + ":%",))}
@@ -491,6 +497,7 @@ def _sync_direction(direction: str) -> str:
                     with conn:
                         conn.execute("DELETE FROM mappings WHERE ym_id = ? AND sp_id = ?", (ym_id, sp_id))
                     mappings.pop(source.id, None)
+                    claimed_target_ids.discard(mapped_id)
                 else:
                     if not revalidate and mapped_version >= ALGORITHM_VERSION:
                         continue
@@ -508,8 +515,18 @@ def _sync_direction(direction: str) -> str:
                         save_pending(conn, key, direction, source.label, decision, "revalidate")
                         pending_count += 1
                     continue
-            candidates = discover(source, target_client, target_tracks, api_call_with_retry)
-            decision = engine.decide(source, candidates)
+            known = [target for target in target_tracks
+                     if target.id not in claimed_target_ids
+                     and metadata_features(source, target).safe_exact]
+            decision = engine.decide(source, known) if known else None
+            if decision is None or decision.kind is not DecisionKind.MATCH:
+                if last_catalog_search is not None:
+                    wait = CATALOG_SEARCH_INTERVAL_SECONDS - (time.monotonic() - last_catalog_search)
+                    if wait > 0:
+                        time.sleep(wait)
+                last_catalog_search = time.monotonic()
+                candidates = discover(source, target_client, target_tracks, api_call_with_retry)
+                decision = engine.decide(source, candidates)
             logging.info("Match %s %s: %s candidate=%s rank=%s jev=%s reasons=%s",
                          direction, source.id, decision.kind.value,
                          decision.candidate.id if decision.candidate else None,
@@ -544,6 +561,7 @@ def _sync_direction(direction: str) -> str:
                                            reasons=(*decision.reasons, "mapping_conflict"))
                     else:
                         mappings[source.id] = (target.id, ALGORITHM_VERSION)
+                        claimed_target_ids.add(target.id)
                         with conn:
                             conn.execute("DELETE FROM pending_syncs WHERE key = ?", (key,))
                             conn.execute("DELETE FROM failed_syncs WHERE key = ?", (key,))

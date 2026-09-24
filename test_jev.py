@@ -162,8 +162,9 @@ class JevTests(unittest.TestCase):
              patch.object(sync, "get_sp_client", return_value=object()), \
              patch.object(sync, "get_ym_likes", return_value=[source]), \
              patch.object(sync, "get_sp_likes", return_value=[target]), \
-             patch.object(sync, "discover_spotify", return_value=[Track("spotify", "sp1", "Song", ("Artist",), duration_ms=180000)]):
+             patch.object(sync, "discover_spotify", return_value=[Track("spotify", "sp1", "Song", ("Artist",), duration_ms=180000)]) as discover:
             self.assertIn("на одобрении 1", sync.sync_ym_to_sp())
+        discover.assert_called_once()
         with closing(sqlite3.connect(sync.DB_FILE)) as db:
             self.assertEqual(db.execute("SELECT ym_id, sp_id FROM mappings").fetchall(), [("ym2", "sp1")])
         self.assertIn("mapping_conflict", sync.get_pending_tracks()["ym_to_sp:ym1"]["reasons"])

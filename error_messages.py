@@ -33,6 +33,13 @@ def explain_error(error):
         if error.http_status == 401:
             return "Spotify: авторизация недействительна. Повторите auth_spotify.py."
         if error.http_status == 429:
+            headers = error.headers or {}
+            retry_after = headers.get("Retry-After") or headers.get("retry-after")
+            if retry_after and str(retry_after).isdigit():
+                hours, remainder = divmod(int(retry_after), 3600)
+                if hours:
+                    return f"Spotify: лимит запросов. Повторите примерно через {hours} ч {remainder // 60} мин."
+                return f"Spotify: лимит запросов. Повторите через {max(1, remainder // 60)} мин."
             return "Spotify: лимит запросов. Подождите и повторите позже."
         if error.http_status >= 500:
             return "Spotify временно недоступен. Повторите позже."

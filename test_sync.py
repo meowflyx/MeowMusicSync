@@ -91,6 +91,61 @@ class SyncRegressionTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertIn("Premium", str(error))
 
+    def test_spotify_rate_limit_does_not_block_or_retry(self):
+        calls = []
+        limited = SpotifyException(429, -1, "Rate limited",
+                                   headers={"Retry-After": "46427"})
+
+        def denied():
+            calls.append(1)
+            raise limited
+
+        with patch.object(sync.time, "sleep", side_effect=AssertionError("must not sleep")):
+            _, error = sync.api_call_with_retry(denied)
+        self.assertIs(error, limited)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("12 ч", explain_error(error))
+
+    def test_spotify_client_disables_long_internal_rate_limit_wait(self):
+        auth_manager = SimpleNamespace(
+            cache_handler=SimpleNamespace(get_cached_token=lambda: {"access_token": "test"}),
+            validate_token=lambda token: True)
+        with patch.multiple(sync, SPOTIPY_CLIENT_ID="id", SPOTIPY_CLIENT_SECRET="secret",
+                            SPOTIPY_REDIRECT_URI="http://127.0.0.1:8888/callback"), \
+             patch.object(sync, "SpotifyOAuth", return_value=auth_manager), \
+             patch.object(sync.spotipy, "Spotify", return_value=object()) as spotify:
+            sync.get_sp_client()
+        self.assertEqual(spotify.call_args.kwargs["status_retries"], 0)
+        self.assertNotIn(429, spotify.call_args.kwargs["status_forcelist"])
+
+    def test_existing_library_match_skips_catalog_search(self):
+        source = {"id": "ym", "artists": "Artist", "title": "Song",
+                  "duration_ms": 180000}
+        target = {"id": "sp", "artists": "Artist", "title": "Song",
+                  "duration_ms": 180000}
+        with patch.object(sync, "get_ym_client", return_value=object()), \
+             patch.object(sync, "get_sp_client", return_value=object()), \
+             patch.object(sync, "get_ym_likes", return_value=[source]), \
+             patch.object(sync, "get_sp_likes", return_value=[target]), \
+             patch.object(sync, "discover_spotify", side_effect=AssertionError("unneeded search")):
+            self.assertIn("не найдено 0", sync.sync_ym_to_sp())
+        with closing(sqlite3.connect(sync.DB_FILE)) as db:
+            self.assertEqual(db.execute("SELECT ym_id,sp_id FROM mappings").fetchone(),
+                             ("ym", "sp"))
+
+    def test_catalog_search_is_paced_between_tracks(self):
+        sources = [{"id": id, "artists": "Artist", "title": f"Song {id}"}
+                   for id in ("1", "2")]
+        with patch.object(sync, "get_ym_client", return_value=object()), \
+             patch.object(sync, "get_sp_client", return_value=object()), \
+             patch.object(sync, "get_ym_likes", return_value=sources), \
+             patch.object(sync, "get_sp_likes", return_value=[]), \
+             patch.object(sync, "discover_spotify", return_value=[]), \
+             patch.object(sync.time, "monotonic", side_effect=[100, 105, 110]), \
+             patch.object(sync.time, "sleep") as sleep:
+            sync.sync_ym_to_sp()
+        sleep.assert_called_once_with(5)
+
     def test_error_messages_distinguish_access_and_auth_failures(self):
         self.assertNotIn("требует Premium", explain_error(SpotifyException(403, -1, "Forbidden")))
         self.assertIn("Users and Access", explain_error(SpotifyException(403, -1, "Forbidden")))
