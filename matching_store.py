@@ -8,7 +8,7 @@ from enum import Enum
 
 from matching import ALGORITHM_VERSION, Decision
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 class MappingResult(str, Enum):
     CREATED = "created"
@@ -43,6 +43,12 @@ def migrate_matching(conn: sqlite3.Connection) -> None:
         conn.execute("DROP TABLE IF EXISTS yandex_cache")
         conn.execute("DROP TABLE IF EXISTS spotify_cache")
         conn.execute("DROP TABLE IF EXISTS blacklist")
+        conn.execute("DELETE FROM pending_syncs WHERE purpose = 'add' AND ("
+                     "key IN (SELECT 'ym_to_sp:' || ym_id FROM mappings WHERE status = 'active') "
+                     "OR key IN (SELECT 'sp_to_ym:' || sp_id FROM mappings WHERE status = 'active'))")
+        conn.execute("DELETE FROM failed_syncs WHERE "
+                     "key IN (SELECT 'ym_to_sp:' || ym_id FROM mappings WHERE status = 'active') "
+                     "OR key IN (SELECT 'sp_to_ym:' || sp_id FROM mappings WHERE status = 'active')")
         conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
@@ -59,11 +65,16 @@ def save_mapping(conn: sqlite3.Connection, ym_id: str, sp_id: str,
                          "validated_at = CURRENT_TIMESTAMP, status = 'active' "
                          "WHERE ym_id = ? AND sp_id = ?",
                          (provenance, mode, ALGORITHM_VERSION, str(ym_id), str(sp_id)))
-            return MappingResult.UPDATED
-        conn.execute("INSERT INTO mappings (ym_id, sp_id, provenance, mode, algorithm_version, "
-                     "validated_at, status) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 'active')",
-                     (str(ym_id), str(sp_id), provenance, mode, ALGORITHM_VERSION))
-        return MappingResult.CREATED
+            result = MappingResult.UPDATED
+        else:
+            conn.execute("INSERT INTO mappings (ym_id, sp_id, provenance, mode, algorithm_version, "
+                         "validated_at, status) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 'active')",
+                         (str(ym_id), str(sp_id), provenance, mode, ALGORITHM_VERSION))
+            result = MappingResult.CREATED
+        keys = (f"ym_to_sp:{ym_id}", f"sp_to_ym:{sp_id}")
+        conn.execute("DELETE FROM pending_syncs WHERE key IN (?, ?)", keys)
+        conn.execute("DELETE FROM failed_syncs WHERE key IN (?, ?)", keys)
+        return result
 
 
 def save_pending(conn: sqlite3.Connection, key: str, direction: str,

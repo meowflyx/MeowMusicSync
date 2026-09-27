@@ -153,6 +153,43 @@ class DiscoveryTests(unittest.TestCase):
 
 
 class StoreTests(unittest.TestCase):
+    def test_migration_removes_resolved_pending_but_preserves_other_reviews(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = sqlite3.connect(Path(directory) / "sync.db")
+            db.execute("CREATE TABLE mappings (ym_id TEXT UNIQUE, sp_id TEXT UNIQUE)")
+            db.execute("CREATE TABLE pending_syncs (key TEXT PRIMARY KEY, score INTEGER)")
+            db.execute("CREATE TABLE failed_syncs (key TEXT PRIMARY KEY, query TEXT)")
+            db.execute("INSERT INTO mappings VALUES ('ym1', 'sp1')")
+            db.executemany("INSERT INTO pending_syncs VALUES (?, 95)",
+                           [("ym_to_sp:ym1",), ("sp_to_ym:sp1",), ("ym_to_sp:other",)])
+            db.execute("INSERT INTO failed_syncs VALUES ('sp_to_ym:sp1', 'old rejection')")
+
+            migrate_matching(db)
+
+            self.assertEqual(db.execute("SELECT key FROM pending_syncs").fetchall(),
+                             [("ym_to_sp:other",)])
+            self.assertEqual(db.execute("SELECT count(*) FROM failed_syncs").fetchone()[0], 0)
+            db.close()
+
+    def test_saving_mapping_resolves_pending_in_both_directions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = sqlite3.connect(Path(directory) / "sync.db")
+            db.execute("CREATE TABLE mappings (ym_id TEXT UNIQUE, sp_id TEXT UNIQUE)")
+            db.execute("CREATE TABLE pending_syncs (key TEXT PRIMARY KEY, score INTEGER)")
+            db.execute("CREATE TABLE failed_syncs (key TEXT PRIMARY KEY, query TEXT)")
+            migrate_matching(db)
+            db.executemany("INSERT INTO pending_syncs (key, score) VALUES (?, 95)",
+                           [("ym_to_sp:ym1",), ("sp_to_ym:sp1",), ("ym_to_sp:other",)])
+            db.execute("INSERT INTO failed_syncs (key, query) VALUES ('sp_to_ym:sp1', 'old rejection')")
+
+            self.assertEqual(save_mapping(db, "ym1", "sp1", "hybrid", "jev"),
+                             MappingResult.CREATED)
+
+            self.assertEqual(db.execute("SELECT key FROM pending_syncs").fetchall(),
+                             [("ym_to_sp:other",)])
+            self.assertEqual(db.execute("SELECT count(*) FROM failed_syncs").fetchone()[0], 0)
+            db.close()
+
     def test_migration_preserves_legacy_mapping_and_conflicts_are_explicit(self):
         with tempfile.TemporaryDirectory() as directory:
             db = sqlite3.connect(Path(directory) / "sync.db")
