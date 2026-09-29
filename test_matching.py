@@ -2,6 +2,7 @@
 
 import sqlite3
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -62,6 +63,18 @@ class MetadataTests(unittest.TestCase):
 
 
 class EngineTests(unittest.TestCase):
+    def test_jev_checks_multiple_candidates_concurrently(self):
+        started = threading.Barrier(3, timeout=3)
+
+        def verify(source, candidate):
+            started.wait()
+            return {"first": .1, "best": .96, "third": .2}[candidate.id]
+
+        decision = MatchingEngine(MatchingMode.JEV_ONLY, verify).decide(
+            track("source"), [track("first"), track("best"), track("third")])
+        self.assertEqual((decision.kind, decision.candidate.id),
+                         (DecisionKind.MATCH, "best"))
+
     def test_hybrid_chooses_second_candidate_after_comparing_pool(self):
         wrong = track("wrong", "Song - Remix")
         right = track("right")

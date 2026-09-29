@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from enum import Enum
+from itertools import repeat
 from typing import Callable, Iterable
 
 
 ALGORITHM_VERSION = 3
+JEV_PARALLELISM = 3
 
 
 class MatchingMode(str, Enum):
@@ -220,9 +223,15 @@ class MatchingEngine:
             return Decision(DecisionKind.REJECT, self.mode, reasons=("no_plausible_title",),
                             considered=tuple(ranked))
         if self.verify:
-            evaluated = [CandidateEvidence(item.candidate, item.features,
-                         self.verify(source, item.candidate))
-                         for item in plausible[:THRESHOLDS.max_jev_candidates]]
+            selected = plausible[:THRESHOLDS.max_jev_candidates]
+            if len(selected) == 1:
+                probabilities = [self.verify(source, selected[0].candidate)]
+            else:
+                with ThreadPoolExecutor(max_workers=JEV_PARALLELISM) as pool:
+                    probabilities = list(pool.map(
+                        self.verify, repeat(source), (item.candidate for item in selected)))
+            evaluated = [CandidateEvidence(item.candidate, item.features, probability)
+                         for item, probability in zip(selected, probabilities)]
             evaluated.sort(key=lambda item: item.jev_probability, reverse=True)
             best = evaluated[0]
             close = [item for item in evaluated[1:]
