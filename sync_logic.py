@@ -406,7 +406,9 @@ def get_sp_likes(sp_client) -> list[dict]:
     """Fetch current saved-record metadata directly from Spotify."""
     result = sp_client.current_user_saved_tracks(limit=50)
     tracks = []
-    while result:
+    while True:
+        if not isinstance(result, dict) or not isinstance(result.get("items"), list):
+            raise RuntimeError("Spotify вернул неполную библиотеку. Синхронизация остановлена; повторите позже.")
         for item in result["items"]:
             data = item.get("track")
             if not data or not data.get("id") or data.get("is_local"):
@@ -417,7 +419,9 @@ def get_sp_likes(sp_client) -> list[dict]:
                            "album": record.album, "duration_ms": record.duration_ms,
                            "isrc": record.isrc, "explicit": record.explicit,
                            "added_at": item.get("added_at") or ""})
-        result = sp_client.next(result) if result.get("next") else None
+        if not result.get("next"):
+            break
+        result = sp_client.next(result)
     return tracks
 
 
@@ -476,19 +480,21 @@ def _sync_direction(direction: str) -> str:
             "SELECT ym_id, sp_id, algorithm_version FROM mappings" if source_is_yandex
             else "SELECT sp_id, ym_id, algorithm_version FROM mappings")}
         claimed_target_ids = {target_id for target_id, _ in mappings.values()}
-        failed = {row[0]: (row[1], row[2]) for row in conn.execute(
-            "SELECT key, algorithm_version, mode FROM failed_syncs WHERE key LIKE ?",
+        failed = {row[0]: (row[1], row[2], row[3]) for row in conn.execute(
+            "SELECT key, algorithm_version, mode, reason FROM failed_syncs WHERE key LIKE ?",
             (direction + ":%",))}
         pending = {row[0]: (row[1], row[2]) for row in conn.execute(
             "SELECT key, algorithm_version, mode FROM pending_syncs WHERE key LIKE ?",
             (direction + ":%",))}
         for source in source_tracks:
             key = f"{direction}:{source.id}"
-            if ((key in pending and pending[key] == (ALGORITHM_VERSION, engine.mode.value))
-                    or (key in failed and failed[key] == (ALGORITHM_VERSION, engine.mode.value))):
+            mapped = mappings.get(source.id)
+            if not (revalidate and mapped) and (
+                    (key in pending and pending[key] == (ALGORITHM_VERSION, engine.mode.value))
+                    or (key in failed and (failed[key][:2] == (ALGORITHM_VERSION, engine.mode.value)
+                                           or failed[key][2] == "manual_rejection"))):
                 skipped += 1
                 continue
-            mapped = mappings.get(source.id)
             if mapped:
                 mapped_id, mapped_version = mapped
                 if mapped_id not in target_ids:
@@ -642,6 +648,11 @@ def approve_pending(pend_key: str, expected_candidate_id: str | None = None) -> 
             return False, f"Неизвестное направление: {direction}"
         ym_id, sp_id = ((source_id, found_id) if direction == "ym_to_sp"
                         else (found_id, source_id))
+        if purpose == "revalidate" and not conn.execute(
+                "SELECT 1 FROM mappings WHERE ym_id = ? AND sp_id = ?", (ym_id, sp_id)).fetchone():
+            with conn:
+                conn.execute("DELETE FROM pending_syncs WHERE key = ?", (pend_key,))
+            return False, "Старая пара больше не существует. Обновите /pending"
         conflict = conn.execute("SELECT 1 FROM mappings WHERE "
                                 "(ym_id = ? AND sp_id <> ?) OR (sp_id = ? AND ym_id <> ?)",
                                 (ym_id, sp_id, sp_id, ym_id)).fetchone()
@@ -682,6 +693,9 @@ def reject_pending(pend_key):
                 ym_id, sp_id = ((source_id, found_id) if direction == "ym_to_sp"
                                 else (found_id, source_id))
                 conn.execute("DELETE FROM mappings WHERE ym_id = ? AND sp_id = ?", (ym_id, sp_id))
+                reverse_key = f"sp_to_ym:{sp_id}" if direction == "ym_to_sp" else f"ym_to_sp:{ym_id}"
+                conn.execute("DELETE FROM pending_syncs WHERE key = ? AND found_id = ? "
+                             "AND purpose = 'revalidate'", (reverse_key, source_id))
             conn.execute("DELETE FROM pending_syncs WHERE key = ?", (pend_key,))
         save_failed(conn, pend_key, source_name, mode or MatchingMode.HYBRID.value,
                     "manual_rejection")
@@ -698,9 +712,13 @@ def check_duplicate(track1: dict, track2: dict) -> bool:
     return metadata_features(left, right).safe_exact
 
 
-def _duplicate_groups(tracks, timestamp_field):
+def _duplicate_groups(tracks: list[dict], timestamp_field: str) -> list[dict]:
+    # Pagination and album references can repeat a like; only distinct IDs can be deleted.
+    unique = {}
+    for track in sorted(tracks, key=lambda row: row.get(timestamp_field) or "", reverse=True):
+        unique.setdefault(str(track["id"]), track)
     keep, duplicate = [], []
-    for track in sorted(tracks, key=lambda row: row.get(timestamp_field, ""), reverse=True):
+    for track in unique.values():
         (duplicate if any(check_duplicate(track, previous) for previous in keep) else keep).append(track)
     return duplicate
 
@@ -712,7 +730,7 @@ def remove_spotify_duplicates():
         return False, "Клиент Spotify не настроен"
     try:
         tracks = get_sp_likes(client)
-    except (SpotifyException, SpotifyOauthError, OSError, TimeoutError, ValueError) as error:
+    except (SpotifyException, SpotifyOauthError, OSError, TimeoutError, ValueError, RuntimeError) as error:
         return False, explain_error(error)
     if not tracks:
         return True, "Библиотека Spotify пуста."
@@ -741,7 +759,7 @@ def remove_yandex_duplicates():
     try:
         tracks = get_ym_likes(client)
     except (UnauthorizedError, BadRequestError, NotFoundError,
-            OSError, TimeoutError, ValueError) as error:
+            OSError, TimeoutError, ValueError, RuntimeError) as error:
         return False, explain_error(error)
     if not tracks:
         return True, "Библиотека Яндекс Музыки пуста."

@@ -74,7 +74,15 @@ def discover_yandex(source: Track, client, existing: Iterable[Track] = (),
                 raise error
         else:
             result = client.search(query, type_="track")
-        for item in (getattr(getattr(result, "tracks", None), "results", None) or [])[:20]:
+        if result is None or not hasattr(result, "tracks"):
+            raise RuntimeError("Яндекс вернул некорректный ответ поиска. Синхронизация остановлена; повторите позже.")
+        # The SDK permits tracks=None in a valid empty Search; a missing response is an outage.
+        if result.tracks is None:
+            continue
+        items = getattr(result.tracks, "results", None)
+        if not isinstance(items, list):
+            raise RuntimeError("Яндекс вернул некорректные результаты поиска. Синхронизация остановлена; повторите позже.")
+        for item in items[:20]:
             candidate = yandex_track(item)
             if candidate.id and candidate.title:
                 pool.setdefault(candidate.id, candidate)

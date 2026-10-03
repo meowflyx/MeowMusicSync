@@ -83,6 +83,18 @@ class JevTests(unittest.TestCase):
         self.assertEqual(open_api.call_count, 2)
         sleep.assert_called_once()
 
+    def test_jev_receives_named_version_identity(self):
+        def fake_open(request, timeout):
+            body = json.loads(request.data)
+            self.assertEqual(body["state"]["yandex"]["version_descriptions"], ["alice remix"])
+            self.assertEqual(body["state"]["spotify"]["version_descriptions"], ["bob remix"])
+            self.assertIn("Different named remixes", body["questions"]["same_track"]["instructions"])
+            return self._response({"answers": {"same_track": {"probability": .01}}})
+        with patch.object(jev, "urlopen", side_effect=fake_open):
+            self.assertEqual(jev.match_probability("vercel", "secret",
+                Track("yandex", "ym", "Song (Alice Remix)", ("Artist",)),
+                Track("spotify", "sp", "Song (Bob Remix)", ("Artist",))), .01)
+
     def test_jev_only_requires_configuration_and_disallows_disable(self):
         with self.assertRaisesRegex(ValueError, "Jev"):
             sync.set_matching_mode("jev_only")
@@ -135,6 +147,30 @@ class JevTests(unittest.TestCase):
         with closing(sqlite3.connect(sync.DB_FILE)) as db:
             self.assertEqual(db.execute("SELECT status, provenance FROM mappings").fetchone(),
                              ("active", "manual_review"))
+
+    def test_orphaned_revalidation_cannot_recreate_a_missing_mapping(self):
+        with closing(sqlite3.connect(sync.DB_FILE)) as db, db:
+            db.execute("INSERT INTO pending_syncs (key,direction,found_id,purpose) "
+                       "VALUES ('ym_to_sp:ym','ym_to_sp','sp','revalidate')")
+        self.assertFalse(sync.approve_pending("ym_to_sp:ym", "sp")[0])
+        self.assertEqual(sync.get_pending_tracks(), {})
+        self.assertEqual(sync.get_status_stats()["mappings"], 0)
+
+    def test_forced_revalidation_leaves_unrelated_manual_rejection_cached(self):
+        source = {"id": "unrelated", "title": "Song", "artists": "Artist", "duration_ms": 180000}
+        from matching_store import save_failed
+        with closing(sqlite3.connect(sync.DB_FILE)) as db:
+            save_failed(db, "ym_to_sp:unrelated", "Song", "hybrid", "manual_rejection")
+            with db:
+                db.execute("UPDATE failed_syncs SET algorithm_version = 0")
+        sync.set_setting("matching_revalidate", "1")
+        with patch.object(sync, "get_ym_client", return_value=object()), \
+             patch.object(sync, "get_sp_client", return_value=object()), \
+             patch.object(sync, "get_ym_likes", return_value=[source]), \
+             patch.object(sync, "get_sp_likes", return_value=[]), \
+             patch.object(sync, "discover_spotify", side_effect=AssertionError("manual rejection must persist")):
+            self.assertIn("Пропущено: 1", sync.sync_ym_to_sp())
+        self.assertIn("ym_to_sp:unrelated", sync.get_failed_tracks())
 
     def test_old_pending_retries_with_censorship_policy_in_both_directions(self):
         sync.configure_jev("openrouter", "test-private-key")

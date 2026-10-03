@@ -48,13 +48,14 @@ def decrypt_key(ciphertext):
 
 
 def _record(track: Track) -> dict:
-    base_title, markers = title_features(track)
+    title = title_features(track)
     censorship = censorship_features(track)
     return {"platform": track.platform, "id": track.id, "title": track.title,
             "artists": track.artists, "album": track.album,
             "duration_ms": track.duration_ms, "isrc": track.isrc,
             "explicit": track.explicit, "version": track.version,
-            "base_title": base_title, "version_markers": sorted(markers),
+            "base_title": title.base_title, "version_markers": sorted(title.version_markers),
+            "version_descriptions": sorted(title.version_descriptions),
             "censorship_hints": censorship.hints, "uncensored_evidence": censorship.uncensored,
             "featured_artists": [match.group(1) for match in FEATURED.finditer(track.title)]}
 
@@ -80,8 +81,10 @@ def match_probability(provider: str, api_key: str, yandex: Track, spotify: Track
                 "different recording. A remaster, remix, live, acoustic, radio edit, cover, "
                 "instrumental, slowed, sped-up, demo, or rerecording is a different version. "
                 "Version clues can occur in the track title, version field, or album title; "
-                "compare them. Compare ISRCs when both are supplied. Missing fields are unknown, "
-                "not mismatches. A clean, censored, bleeped, edited, family-friendly, radio or TV "
+                "compare them. Compare ISRCs when both are supplied. Missing fields are unknown, not mismatches. "
+                "Different named remixes, remixers, mixes, edits or live venues are different versions; "
+                "a shared generic marker such as remix does not establish recording identity. "
+                "A clean, censored, bleeped, edited, family-friendly, radio or TV "
                 "edit is not equivalent to its uncensored/explicit recording, even with similar "
                 "duration or shared ISRC. A masked title (e.g. ***** Please II) is a censorship "
                 "clue; consider the explicit flags and other metadata. Explicit, uncensored, "

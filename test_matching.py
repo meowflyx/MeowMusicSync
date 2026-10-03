@@ -18,6 +18,37 @@ def track(id, title="Song", artists=("Artist",), **kwargs):
 
 
 class MetadataTests(unittest.TestCase):
+    def test_named_versions_preserve_recording_identity_in_both_modes(self):
+        for version in ("Remix", "Mix", "Edit", "Live at", "Acoustic Take"):
+            left = track("source", f"Song (Alice {version})")
+            right = track("candidate", f"Song (Bob {version})")
+            with self.subTest(version=version):
+                features = metadata_features(left, right)
+                self.assertFalse(features.safe_exact)
+                self.assertIn("version_descriptions_differ", features.reasons)
+                for mode in MatchingMode:
+                    decision = MatchingEngine(mode, lambda *_: .99).decide(left, [right])
+                    self.assertNotEqual(decision.kind, DecisionKind.MATCH)
+
+    def test_same_named_version_survives_platform_formatting(self):
+        left = track("source", "Song (Alice Remix)")
+        for right in (track("candidate", "SONG - ALICE REMIX"),
+                      track("candidate", version="Alice Remix"),
+                      track("candidate", "Song [Remix by Alice]")):
+            with self.subTest(right=right):
+                self.assertTrue(metadata_features(left, right).safe_exact)
+
+    def test_remixer_identity_keeps_words_that_resemble_censorship_labels(self):
+        for left, right in (("Clean Bandit", "Bandit"), ("Dirty South", "South"),
+                            ("Explicit", "Other")):
+            with self.subTest(left=left, right=right):
+                self.assertFalse(metadata_features(track("source", f"Song ({left} Remix)"),
+                                                   track("candidate", f"Song ({right} Remix)")).safe_exact)
+
+    def test_generic_remix_is_not_proof_of_a_specific_remixer(self):
+        self.assertFalse(metadata_features(track("source", "Song (Remix)"),
+                                          track("candidate", "Song (Alice Remix)")).safe_exact)
+
     def test_same_recording_metadata_variants(self):
         pairs = [
             (track("1"), track("2")),

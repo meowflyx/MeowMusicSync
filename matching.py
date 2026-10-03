@@ -13,7 +13,7 @@ from itertools import repeat
 from typing import Callable, Iterable
 
 
-ALGORITHM_VERSION = 4
+ALGORITHM_VERSION = 5
 JEV_PARALLELISM = 3
 
 
@@ -63,6 +63,13 @@ class Track:
 
 
 @dataclass(frozen=True)
+class TitleMetadata:
+    base_title: str
+    version_markers: frozenset[str]
+    version_descriptions: frozenset[str]
+
+
+@dataclass(frozen=True)
 class Features:
     rank: float
     safe_exact: bool
@@ -72,6 +79,7 @@ class Features:
     version_markers: tuple[str, ...]
     conflict: bool = False
     blocked: bool = False
+    version_descriptions: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -190,7 +198,20 @@ def artist_names(track: Track) -> frozenset[str]:
                      if normalize(part))
 
 
-def title_features(track: Track) -> tuple[str, frozenset[str]]:
+def _version_description(label: str) -> str | None:
+    text = label
+    for pattern in (CLEAN_LABELS, UNCENSORED_LABELS):
+        if _has_version_label(pattern, [label]):
+            text = pattern.sub("", text)
+    markers = {"remaster" if match.group().casefold().startswith("remaster")
+               else normalize(match.group()) for match in MARKERS.finditer(text)}
+    if not markers:
+        return None
+    identity = normalize(MARKERS.sub("", text)).removeprefix("by ")
+    return " ".join(part for part in (identity, *sorted(markers)) if part)
+
+
+def title_features(track: Track) -> TitleMetadata:
     title = FEATURED.sub("", track.title)
     text = f"{title} {track.version or ''}"
     version_text = UNCENSORED_LABELS.sub("", CLEAN_LABELS.sub("", text))
@@ -210,12 +231,19 @@ def title_features(track: Track) -> tuple[str, frozenset[str]]:
                                    (MARKERS, CLEAN_LABELS, UNCENSORED_LABELS)):
             base = parts[0]
             break
-    return normalize(base), frozenset(markers)
+    labels = [part for match in VERSION_LABELS.finditer(title)
+              for part in match.groups() if part]
+    if track.version:
+        labels.append(track.version)
+    descriptions = frozenset(description for label in labels
+                             if (description := _version_description(label)))
+    return TitleMetadata(normalize(base), frozenset(markers), descriptions)
 
 
 def metadata_features(left: Track, right: Track) -> Features:
-    left_title, left_markers = title_features(left)
-    right_title, right_markers = title_features(right)
+    left_metadata, right_metadata = title_features(left), title_features(right)
+    left_title, left_markers = left_metadata.base_title, left_metadata.version_markers
+    right_title, right_markers = right_metadata.base_title, right_metadata.version_markers
     title_ratio = SequenceMatcher(None, left_title, right_title).ratio() if left_title and right_title else 0.0
     left_artists, right_artists = artist_names(left), artist_names(right)
     artist_ratio = len(left_artists & right_artists) / len(left_artists | right_artists) if left_artists | right_artists else 0.0
@@ -227,6 +255,10 @@ def metadata_features(left: Track, right: Track) -> Features:
         conflict = True
     if left_markers != right_markers:
         reasons.append("version_markers_differ")
+        conflict = True
+    version_difference = left_metadata.version_descriptions ^ right_metadata.version_descriptions
+    if version_difference and left_metadata.version_descriptions and right_metadata.version_descriptions:
+        reasons.append("version_descriptions_differ")
         conflict = True
     if left_artists != right_artists:
         reasons.append("artists_differ")
@@ -252,13 +284,15 @@ def metadata_features(left: Track, right: Track) -> Features:
         rank -= 35
     duration_confirmed = (left.duration_ms is not None and right.duration_ms is not None
                           and abs(left.duration_ms - right.duration_ms) <= THRESHOLDS.duration_tolerance_ms)
-    safe_exact = bool(left_title and left_title == right_title and left_artists == right_artists
+    safe_exact = bool(left_title and left_title == right_title and left_artists and left_artists == right_artists
                       and left_markers == right_markers and not conflict
+                      and not version_difference
                       and (duration_confirmed or "isrc_equal" in reasons))
     if "isrc_equal" in reasons and not conflict and title_ratio >= .8 and artist_ratio > 0:
         safe_exact = True
     return Features(max(0.0, min(100.0, rank)), safe_exact, tuple(reasons),
-                    title_ratio, artist_ratio, tuple(sorted(left_markers ^ right_markers)), conflict, blocked)
+                    title_ratio, artist_ratio, tuple(sorted(left_markers ^ right_markers)), conflict, blocked,
+                    tuple(sorted(version_difference)))
 
 
 def _equivalent_releases(left: Track, right: Track) -> bool:
@@ -266,6 +300,7 @@ def _equivalent_releases(left: Track, right: Track) -> bool:
     features = metadata_features(left, right)
     return (features.title_similarity == 1 and features.artist_similarity == 1
             and not features.version_markers
+            and not features.version_descriptions
             and left.duration_ms is not None and right.duration_ms is not None
             and abs(left.duration_ms - right.duration_ms) <= THRESHOLDS.duration_tolerance_ms
             and censorship_features(left).hints == censorship_features(right).hints)

@@ -231,6 +231,7 @@ def pending_card(key: str, entry: dict) -> tuple[str, InlineKeyboardMarkup]:
                     else "Старая оценка: источник не сохранён")
     reason_labels = {
         "version_markers_differ": "разные версии записи",
+        "version_descriptions_differ": "разные ремиксы, редакции или описания версии",
         "artists_differ": "разный состав артистов",
         "isrc_conflict": "разные ISRC",
         "isrc_equal": "одинаковый ISRC",

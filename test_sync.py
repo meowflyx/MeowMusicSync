@@ -241,6 +241,36 @@ class SyncRegressionTests(unittest.TestCase):
             "next": None})
         self.assertEqual([t["id"] for t in sync.get_sp_likes(client)], ["abc"])
 
+    def test_malformed_spotify_snapshot_stops_sync_before_mapping_changes(self):
+        with closing(sqlite3.connect(sync.DB_FILE)) as db, db:
+            db.execute("INSERT INTO mappings (ym_id,sp_id) VALUES ('ym','sp')")
+        for page in (None, {}, {"items": None}, {"items": {}},
+                     {"items": [], "next": "page2"}):
+            with self.subTest(page=page):
+                client = SimpleNamespace(current_user_saved_tracks=lambda **kw: page,
+                                         next=lambda result: None)
+                with patch.object(sync, "get_ym_client", return_value=object()), \
+                     patch.object(sync, "get_sp_client", return_value=client), \
+                     patch.object(sync, "get_ym_likes", return_value=[]):
+                    with self.assertRaises(RuntimeError):
+                        sync.sync_ym_to_sp()
+                with closing(sqlite3.connect(sync.DB_FILE)) as db:
+                    self.assertEqual(db.execute("SELECT ym_id,sp_id FROM mappings").fetchall(),
+                                     [("ym", "sp")])
+
+    def test_yandex_valid_empty_search_is_not_an_outage(self):
+        for result in (SimpleNamespace(tracks=None), SimpleNamespace(tracks=SimpleNamespace(results=[]))):
+            with self.subTest(result=result):
+                client = SimpleNamespace(search=lambda *args, **kwargs: result)
+                self.assertEqual(discover_yandex(Track("spotify", "s", "Song", ("Artist",)), client), [])
+
+    def test_yandex_malformed_search_is_not_an_empty_catalog(self):
+        for result in (None, SimpleNamespace(), SimpleNamespace(tracks=SimpleNamespace(results=None))):
+            with self.subTest(result=result):
+                client = SimpleNamespace(search=lambda *args, **kwargs: result)
+                with self.assertRaises(RuntimeError):
+                    discover_yandex(Track("spotify", "s", "Song", ("Artist",)), client)
+
     def test_search_outage_is_not_a_negative_match(self):
         def unavailable(*args, **kwargs):
             raise ConnectionError("offline")
