@@ -597,7 +597,36 @@ def sync_sp_to_ym() -> str:
 
 
 @serialized
-def approve_pending(pend_key):
+def select_pending_candidate(pend_key: str, candidate_id: str) -> tuple[bool, str]:
+    """Select only a candidate recorded in this pending decision; do not call platform APIs."""
+    init_db()
+    with closing(sqlite3.connect(DB_FILE)) as conn:
+        row = conn.execute("SELECT diagnostics, purpose, found_id FROM pending_syncs WHERE key = ?",
+                           (pend_key,)).fetchone()
+        if not row:
+            return False, "Трек уже обработан. Обновите /pending"
+        diagnostics, purpose, found_id = row
+        candidate = next((item for item in json.loads(diagnostics or "[]")
+                          if item.get("id") == candidate_id), None)
+        if not candidate:
+            return False, "Кандидат больше не доступен. Обновите /pending"
+        if purpose == "revalidate" and candidate_id != found_id:
+            return False, "При проверке старой пары можно подтвердить только её текущий трек"
+        probability = candidate.get("jev")
+        rank = candidate.get("rank")
+        score_type = "jev" if probability is not None else "metadata"
+        score = round(probability * 100 if probability is not None else (rank or 0))
+        with conn:
+            conn.execute("UPDATE pending_syncs SET found_id = ?, found = ?, score = ?, "
+                         "score_type = ?, metadata_rank = ?, jev_probability = ?, reasons = ? "
+                         "WHERE key = ?", (candidate_id, candidate["label"], score, score_type,
+                                         rank, probability,
+                                         json.dumps(candidate.get("reasons", []), ensure_ascii=False), pend_key))
+        return True, "Кандидат выбран"
+
+
+@serialized
+def approve_pending(pend_key: str, expected_candidate_id: str | None = None) -> tuple[bool, str]:
     """Apply an explicit human decision, including revalidation without re-liking."""
     init_db()
     with closing(sqlite3.connect(DB_FILE)) as conn:
@@ -606,6 +635,8 @@ def approve_pending(pend_key):
         if not row:
             return False, "Трек не найден в ожидающих"
         direction, found_id, found_name, source_name, purpose, mode = row
+        if expected_candidate_id is not None and found_id != expected_candidate_id:
+            return False, "Выбранный кандидат изменился. Обновите /pending перед одобрением"
         source_id = pend_key.split(":", 1)[1]
         if direction not in ("ym_to_sp", "sp_to_ym"):
             return False, f"Неизвестное направление: {direction}"

@@ -17,7 +17,7 @@ from logging.handlers import TimedRotatingFileHandler
 from config import TG_BOT_TOKEN, TG_ADMIN_ID
 from sync_logic import (
     sync_ym_to_sp, sync_sp_to_ym, full_two_way_sync,
-    approve_pending, reject_pending, get_status_stats,
+    approve_pending, reject_pending, select_pending_candidate, get_status_stats,
     get_pending_tracks, clear_failed_tracks, get_failed_tracks,
     remove_spotify_duplicates,
     remove_yandex_duplicates, get_last_sync_info, is_sync_running,
@@ -224,6 +224,61 @@ async def status_handler(message: Message):
     )
 
 
+def pending_card(key: str, entry: dict) -> tuple[str, InlineKeyboardMarkup]:
+    arrow = "🟡 YM → SP" if entry["direction"] == "ym_to_sp" else "🔵 SP → YM"
+    score_label = (f"Jev: {entry['jev_probability']:.1%}; " if entry.get('jev_probability') is not None else "")
+    score_label += (f"Ранг метаданных: {entry['metadata_rank']:.1f}/100" if entry.get('metadata_rank') is not None
+                    else "Старая оценка: источник не сохранён")
+    reason_labels = {
+        "version_markers_differ": "разные версии записи",
+        "artists_differ": "разный состав артистов",
+        "isrc_conflict": "разные ISRC",
+        "isrc_equal": "одинаковый ISRC",
+        "duration_conflict": "большая разница длительности",
+        "duration_differs": "разница длительности",
+        "title_equal": "названия совпали",
+        "jev_rejected": "Jev отверг пару",
+        "jev_close_candidates": "несколько близких кандидатов",
+        "mapping_conflict": "ID уже связан с другой парой",
+    }
+    details = ", ".join(reason_labels.get(reason, reason) for reason in
+                        (entry.get('reasons') or ())) or "нет подробностей"
+    choices = (entry.get('diagnostics') or [])[:5]
+    candidates = "\n".join(
+        f"{'✅' if item['id'] == entry.get('found_id') else '•'} {index}. "
+        f"{item.get('label', item['id'])[:180]}: ранг {item['rank']:.0f}"
+        + (f", Jev {item['jev']:.1%}" if item.get('jev') is not None else "")
+        for index, item in enumerate(choices, 1)
+    )
+    text = (
+        f"⏳ {'Проверка старой пары' if entry.get('purpose') == 'revalidate' else 'Одобрение'}\n"
+        f"Режим: {entry.get('mode') or 'legacy'}; {score_label}\nПричины: {details}\n"
+        f"{arrow}\n\n"
+        f"🔍 Искали: {entry['source'][:700]}\n"
+        f"📀 Выбран: {entry['found'][:700]}"
+        + (f"\nКандидаты:\n{candidates}" if candidates else "")
+    )
+    candidate_buttons = [
+        [InlineKeyboardButton(
+            text=f"{'✅' if item['id'] == entry.get('found_id') else 'Выбрать'} {index}. "
+                 f"{item.get('label', item['id'])[:70]}",
+            callback_data=f"select:{key}:{item['id']}")]
+        for index, item in enumerate(choices, 1) if len(choices) > 1
+    ]
+    approve_data = f"approve:{key}"
+    if entry.get('found_id'):
+        approve_data += f":{entry['found_id']}"
+    kb = InlineKeyboardMarkup(inline_keyboard=candidate_buttons + [
+        [
+            InlineKeyboardButton(
+                text="✅ Подтвердить" if entry.get('purpose') == 'revalidate' else "✅ Добавить",
+                callback_data=approve_data),
+            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject:{key}"),
+        ]
+    ])
+    return text, kb
+
+
 @dp.message(Command("pending"))
 async def pending_handler(message: Message):
     """List all tracks currently waiting for user manual match approval."""
@@ -241,43 +296,7 @@ async def pending_handler(message: Message):
     if page > pages:
         return await message.answer(f"Всего страниц: {pages}. Начать: /pending")
     for key, entry in list(pending.items())[(page - 1) * 5:page * 5]:
-        arrow = "🟡 YM → SP" if entry["direction"] == "ym_to_sp" else "🔵 SP → YM"
-        score_label = (f"Jev: {entry['jev_probability']:.1%}; " if entry.get('jev_probability') is not None else "")
-        score_label += (f"Ранг метаданных: {entry['metadata_rank']:.1f}/100" if entry.get('metadata_rank') is not None
-                        else "Старая оценка: источник не сохранён")
-        reason_labels = {
-            "version_markers_differ": "разные версии записи",
-            "artists_differ": "разный состав артистов",
-            "isrc_conflict": "разные ISRC",
-            "isrc_equal": "одинаковый ISRC",
-            "duration_conflict": "большая разница длительности",
-            "duration_differs": "разница длительности",
-            "title_equal": "названия совпали",
-            "jev_rejected": "Jev отверг пару",
-            "jev_close_candidates": "несколько близких кандидатов",
-            "mapping_conflict": "ID уже связан с другой парой",
-        }
-        details = ", ".join(reason_labels.get(reason, reason) for reason in
-                            (entry.get('reasons') or ())) or "нет подробностей"
-        candidates = "\n".join(
-            f"• {item.get('label', item['id'])[:100]}: ранг {item['rank']:.0f}"
-            + (f", Jev {item['jev']:.1%}" if item.get('jev') is not None else "")
-            for item in (entry.get('diagnostics') or [])[:3]
-        )
-        text = (
-            f"⏳ {'Проверка старой пары' if entry.get('purpose') == 'revalidate' else 'Одобрение'}\n"
-            f"Режим: {entry.get('mode') or 'legacy'}; {score_label}\nПричины: {details}\n"
-            f"{arrow}\n\n"
-            f"🔍 Искали: {entry['source'][:700]}\n"
-            f"📀 Нашли: {entry['found'][:700]}"
-            + (f"\nКандидаты:\n{candidates}" if candidates else "")
-        )
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text="✅ Добавить", callback_data=f"approve:{key}"),
-                InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject:{key}"),
-            ]
-        ])
+        text, kb = pending_card(key, entry)
         await message.answer(text, reply_markup=kb)
     await message.answer(f"Страница {page}/{pages}. Всего: {len(pending)}.\n"
                          + (f"Далее: /pending {page + 1}\n" if page < pages else "")
@@ -432,16 +451,41 @@ async def like_playlist_handler(message: Message):
         await message.answer(f"❌ {explain_error(error)}")
 
 
+@dp.callback_query(F.data.startswith("select:"))
+async def select_candidate_callback(callback: CallbackQuery):
+    if callback.from_user.id != TG_ADMIN_ID:
+        return await callback.answer("Нет доступа")
+    parts = callback.data.split(":", 3)
+    if len(parts) != 4:
+        return await callback.answer("Некорректный кандидат", show_alert=True)
+    pend_key = ":".join(parts[1:3])
+    await callback.answer("Выбираю…")
+    loop = asyncio.get_running_loop()
+    ok, msg = await loop.run_in_executor(None, select_pending_candidate, pend_key, parts[3])
+    if not ok:
+        return await callback.message.answer(f"⚠️ {msg}")
+    entry = get_pending_tracks().get(pend_key)
+    if not entry:
+        return await callback.message.answer("Трек уже обработан. Обновите /pending")
+    text, keyboard = pending_card(pend_key, entry)
+    if text != callback.message.text or keyboard != callback.message.reply_markup:
+        await callback.message.edit_text(text, reply_markup=keyboard)
+
+
 @dp.callback_query(F.data.startswith("approve:"))
 async def approve_callback(callback: CallbackQuery):
     """Handle the inline callback query to approve a pending track match."""
     if callback.from_user.id != TG_ADMIN_ID:
         return await callback.answer("Нет доступа")
     
-    pend_key = callback.data.split(":", 1)[1]
+    parts = callback.data.split(":", 3)
+    if len(parts) != 4:
+        return await callback.answer("Обновите /pending, чтобы одобрить выбранного кандидата", show_alert=True)
+    pend_key = ":".join(parts[1:3])
+    expected_id = parts[3]
     await callback.answer("Обрабатываю…")
     loop = asyncio.get_running_loop()
-    ok, msg = await loop.run_in_executor(None, approve_pending, pend_key)
+    ok, msg = await loop.run_in_executor(None, approve_pending, pend_key, expected_id)
     
     if ok:
         await callback.message.edit_text(f"✅ {msg}")

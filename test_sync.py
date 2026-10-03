@@ -1,5 +1,6 @@
 """Offline regressions: .venv/bin/python -m unittest -v test_sync"""
 import sqlite3
+import json
 import tempfile
 import unittest
 import logging
@@ -20,6 +21,47 @@ from spotipy.exceptions import SpotifyException, SpotifyOauthError
 
 
 class SyncRegressionTests(unittest.TestCase):
+    def test_pending_candidate_selection_controls_approved_track_in_both_directions(self):
+        for direction in ("ym_to_sp", "sp_to_ym"):
+            with self.subTest(direction=direction):
+                key = f"{direction}:source"
+                candidates = [{"id": "first", "label": "First", "rank": 90, "jev": .8,
+                               "reasons": ["title_equal"]},
+                              {"id": "second", "label": "Second", "rank": 85, "jev": .7,
+                               "reasons": ["artists_differ"]}]
+                with closing(sqlite3.connect(sync.DB_FILE)) as db, db:
+                    db.execute("DELETE FROM mappings")
+                    db.execute("INSERT INTO pending_syncs (key,direction,source,found,found_id,diagnostics) "
+                               "VALUES (?,?,?,?,?,?)", (key, direction, "Source", "First", "first",
+                                                       json.dumps(candidates)))
+                self.assertFalse(sync.select_pending_candidate(key, "unknown")[0])
+                self.assertTrue(sync.select_pending_candidate(key, "second")[0])
+                entry = sync.get_pending_tracks()[key]
+                self.assertEqual((entry["found_id"], entry["found"], entry["jev_probability"]),
+                                 ("second", "Second", .7))
+                self.assertIn("artists_differ", entry["reasons"])
+                with patch.object(sync, "get_sp_client", side_effect=AssertionError("stale approval")), \
+                     patch.object(sync, "get_ym_client", side_effect=AssertionError("stale approval")):
+                    self.assertFalse(sync.approve_pending(key, "first")[0])
+                    conflicting = ("other", "second") if direction == "ym_to_sp" else ("second", "other")
+                    with closing(sqlite3.connect(sync.DB_FILE)) as db, db:
+                        db.execute("INSERT INTO mappings (ym_id,sp_id) VALUES (?,?)", conflicting)
+                    self.assertFalse(sync.approve_pending(key, "second")[0])
+                    self.assertIn(key, sync.get_pending_tracks())
+                    with closing(sqlite3.connect(sync.DB_FILE)) as db, db:
+                        db.execute("DELETE FROM mappings")
+                added = []
+                client = SimpleNamespace(current_user_saved_tracks_add=lambda **kw: added.append(kw),
+                                         users_likes_tracks_add=lambda **kw: added.append(kw))
+                with patch.object(sync, "get_sp_client", return_value=client), \
+                     patch.object(sync, "get_ym_client", return_value=client):
+                    self.assertTrue(sync.approve_pending(key, "second")[0])
+                self.assertEqual(added, [{"tracks" if direction == "ym_to_sp" else "track_ids": ["second"]}])
+                with closing(sqlite3.connect(sync.DB_FILE)) as db:
+                    expected = ("source", "second") if direction == "ym_to_sp" else ("second", "source")
+                    self.assertEqual(db.execute("SELECT ym_id,sp_id FROM mappings").fetchone(), expected)
+                self.assertFalse(sync.select_pending_candidate(key, "second")[0])
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -340,6 +382,55 @@ class SyncRegressionTests(unittest.TestCase):
 
 
 class BotRegressionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_old_approval_button_requires_refresh(self):
+        answers = []
+
+        async def answer(text, **kwargs):
+            answers.append(text)
+
+        callback = SimpleNamespace(from_user=SimpleNamespace(id=42),
+                                   data="approve:ym_to_sp:source", answer=answer)
+        with patch.object(self.bot, "approve_pending", side_effect=AssertionError("unbound approval")):
+            await self.bot.approve_callback(callback)
+        self.assertIn("/pending", answers[0])
+
+    async def test_candidate_callback_updates_card_and_rejects_non_admin(self):
+        edits, answers = [], []
+
+        async def edit_text(text, **kwargs):
+            edits.append((text, kwargs))
+
+        async def answer(text, **kwargs):
+            answers.append(text)
+
+        entry = {"direction": "ym_to_sp", "source": "Source", "found": "Second", "found_id": "second",
+                 "diagnostics": [{"id": "first", "label": "First", "rank": 90, "jev": .8},
+                                 {"id": "second", "label": "Second", "rank": 85, "jev": .7}]}
+        callback = SimpleNamespace(from_user=SimpleNamespace(id=99), data="select:ym_to_sp:source:second",
+                                   answer=answer, message=SimpleNamespace(text="old", reply_markup=None,
+                                                                        edit_text=edit_text, answer=answer))
+        with patch.object(self.bot, "select_pending_candidate", side_effect=AssertionError("no access")):
+            await self.bot.select_candidate_callback(callback)
+        self.assertEqual(edits, [])
+        callback.from_user.id = 42
+        with patch.object(self.bot, "select_pending_candidate", return_value=(True, "selected")), \
+             patch.object(self.bot, "get_pending_tracks", return_value={"ym_to_sp:source": entry}):
+            await self.bot.select_candidate_callback(callback)
+        self.assertIn("📀 Выбран: Second", edits[0][0])
+        buttons = [b for row in edits[0][1]["reply_markup"].inline_keyboard for b in row]
+        self.assertIn("approve:ym_to_sp:source:second", [b.callback_data for b in buttons])
+
+    async def test_pending_card_has_candidate_selection_and_bound_approval(self):
+        entry = {"direction": "ym_to_sp", "source": "Source", "found": "First", "found_id": "first",
+                 "diagnostics": [{"id": "first", "label": "First", "rank": 90, "jev": .8},
+                                 {"id": "second", "label": "Second", "rank": 85, "jev": .7}]}
+        text, keyboard = self.bot.pending_card("ym_to_sp:source", entry)
+        buttons = [b for row in keyboard.inline_keyboard for b in row]
+        self.assertIn("select:ym_to_sp:source:second", [b.callback_data for b in buttons])
+        self.assertIn("approve:ym_to_sp:source:first", [b.callback_data for b in buttons])
+        self.assertIn("2.", text)
+        self.assertTrue(all(len(b.callback_data.encode()) <= 64 for b in buttons))
+
     @classmethod
     def setUpClass(cls):
         import config
