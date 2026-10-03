@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor
@@ -12,7 +13,7 @@ from itertools import repeat
 from typing import Callable, Iterable
 
 
-ALGORITHM_VERSION = 3
+ALGORITHM_VERSION = 4
 JEV_PARALLELISM = 3
 
 
@@ -32,7 +33,7 @@ class DecisionKind(str, Enum):
 class MatchingThresholds:
     jev_match: float = 0.85
     jev_review: float = 0.55
-    jev_margin: float = 0.08
+    jev_margin: float = 0.05
     metadata_review: float = 55.0
     metadata_margin: float = 5.0
     min_title_similarity: float = 0.3
@@ -70,6 +71,15 @@ class Features:
     artist_similarity: float
     version_markers: tuple[str, ...]
     conflict: bool = False
+    blocked: bool = False
+
+
+@dataclass(frozen=True)
+class Censorship:
+    """Version clues; uncensored means positive evidence, never 'not clean'."""
+
+    hints: tuple[str, ...]
+    uncensored: bool
 
 
 @dataclass(frozen=True)
@@ -103,9 +113,61 @@ LATIN_LETTERS = dict(zip("abvgdezijklmnoprstufhcy", "абвгдезийклмн�
 ARTIST_SPLIT = re.compile(r"\s*(?:,|&|\bfeat\.?\b|\bft\.?\b|\bfeaturing\b)\s*", re.I)
 FEATURED = re.compile(r"[([]\s*(?:feat\.?|ft\.?|featuring)\s+([^])]+)[])]", re.I)
 MARKERS = re.compile(
-    r"\b(?:remaster(?:ed)?|remix|live|acoustic|instrumental|radio\s+edit|extended|"
+    r"\b(?:remaster(?:ed)?|remix|live|acoustic|instrumental|radio[ -]+(?:edit|version|mix)|tv[ -]+edit|extended|"
     r"sped\s*up|slowed|demo|cover|re[ -]?record(?:ed|ing)?|version|edit|mix)\b", re.I)
 YEAR = re.compile(r"\b(?:19|20)\d{2}\b")
+VERSION_LABELS = re.compile(r"\(([^()]*)\)|\[([^\[\]]*)\]|\s*[-–—]\s*(.+)$")
+CLEAN_LABELS = re.compile(
+    r"\b(?:squeaky[ -]+clean|clean|censored|edited|amended|bleeped|family[ -]+friendly|"
+    r"(?:non|not|no)[ -]+explicit|without[ -]+swearing|"
+    r"без\s+мата|без\s+ненормативной\s+лексики|цензурная)"
+    r"(?:[ -]+(?:version|edit|mix|lyrics|audio))?\b", re.I)
+RADIO_LABELS = re.compile(r"\b(?:radio[ -]+(?:edit|version|mix)|tv[ -]+edit)\b", re.I)
+UNCENSORED_LABELS = re.compile(
+    r"\b(?:explicit|uncensored|unedited|dirty|без\s+цензуры)(?:[ -]+(?:version|edit|mix))?\b", re.I)
+MASKED_TITLE = re.compile(r"\*{2,}|(?<=\w)\*+(?=\w)|\b[fbs][*#!@$]{2,}\w*", re.I)
+
+
+def _has_version_label(pattern: re.Pattern[str], labels: Iterable[str]) -> bool:
+    # Single words also occur in artist names, e.g. Clean Bandit / Dirty South.
+    return any(match.group().casefold() not in {"clean", "dirty", "explicit"}
+               or normalize(match.group()) == normalize(label)
+               for label in labels for match in pattern.finditer(label))
+
+
+def censorship_features(track: Track) -> Censorship:
+    """Read version labels, not words in ordinary song names or explicit=False alone."""
+    labels = [track.version or ""]
+    title = FEATURED.sub("", track.title)
+    for value in (title, track.album or ""):
+        labels.extend(part for match in VERSION_LABELS.finditer(value)
+                      for part in match.groups() if part)
+        # Multiword version labels sometimes arrive without brackets/separators.
+        labels.extend(match.group() for match in re.finditer(
+            r"\b(?:clean|censored|edited|explicit|dirty)[ -]+(?:version|edit|mix)\b",
+            value, re.I))
+    if track.album and (CLEAN_LABELS.fullmatch(track.album) or
+                        UNCENSORED_LABELS.fullmatch(track.album)):
+        labels.append(track.album)
+    hints = {"clean_version"} if _has_version_label(CLEAN_LABELS, labels) else set()
+    if any(RADIO_LABELS.search(value) for value in (title, track.version or "", track.album or "")):
+        hints.add("radio_edit")
+    if MASKED_TITLE.search(title):
+        hints.add("masked_title")
+    uncensored = track.explicit is True or _has_version_label(UNCENSORED_LABELS, labels)
+    return Censorship(tuple(sorted(hints)), uncensored and not hints)
+
+
+def _censorship_conflict(source: Track, candidate: Track) -> bool:
+    left, right = censorship_features(source), censorship_features(candidate)
+    if ("radio_edit" in left.hints) != ("radio_edit" in right.hints):
+        return True
+    if not left.hints:
+        return bool(right.hints) or (left.uncensored and candidate.explicit is False)
+    if right.uncensored:
+        return True
+    # A known clean source may have an unlabeled counterpart marked nonexplicit.
+    return not right.hints and candidate.explicit is not False
 
 
 def normalize(value: str) -> str:
@@ -131,7 +193,9 @@ def artist_names(track: Track) -> frozenset[str]:
 def title_features(track: Track) -> tuple[str, frozenset[str]]:
     title = FEATURED.sub("", track.title)
     text = f"{title} {track.version or ''}"
-    markers = {match.group().casefold().replace(" ", "_") for match in MARKERS.finditer(text)}
+    version_text = UNCENSORED_LABELS.sub("", CLEAN_LABELS.sub("", text))
+    markers = {match.group().casefold().replace(" ", "_").replace("-", "_")
+               for match in MARKERS.finditer(version_text)}
     if any(marker.startswith("remaster") for marker in markers):
         markers = {"remaster" if marker.startswith("remaster") else marker for marker in markers}
         markers.update(f"remaster_{year}" for year in YEAR.findall(text))
@@ -142,7 +206,8 @@ def title_features(track: Track) -> tuple[str, frozenset[str]]:
     # Remove only a suffix whose content contains a version marker; keep its feature above.
     for separator in (r"\s*[-–—]\s*", r"\s*[([]\s*"):
         parts = re.split(separator, base, maxsplit=1)
-        if len(parts) == 2 and MARKERS.search(parts[1]):
+        if len(parts) == 2 and any(pattern.search(parts[1]) for pattern in
+                                   (MARKERS, CLEAN_LABELS, UNCENSORED_LABELS)):
             base = parts[0]
             break
     return normalize(base), frozenset(markers)
@@ -156,6 +221,10 @@ def metadata_features(left: Track, right: Track) -> Features:
     artist_ratio = len(left_artists & right_artists) / len(left_artists | right_artists) if left_artists | right_artists else 0.0
     reasons = []
     conflict = False
+    blocked = _censorship_conflict(left, right)
+    if blocked:
+        reasons.append("censorship_conflict")
+        conflict = True
     if left_markers != right_markers:
         reasons.append("version_markers_differ")
         conflict = True
@@ -189,7 +258,7 @@ def metadata_features(left: Track, right: Track) -> Features:
     if "isrc_equal" in reasons and not conflict and title_ratio >= .8 and artist_ratio > 0:
         safe_exact = True
     return Features(max(0.0, min(100.0, rank)), safe_exact, tuple(reasons),
-                    title_ratio, artist_ratio, tuple(sorted(left_markers ^ right_markers)), conflict)
+                    title_ratio, artist_ratio, tuple(sorted(left_markers ^ right_markers)), conflict, blocked)
 
 
 def _equivalent_releases(left: Track, right: Track) -> bool:
@@ -199,8 +268,7 @@ def _equivalent_releases(left: Track, right: Track) -> bool:
             and not features.version_markers
             and left.duration_ms is not None and right.duration_ms is not None
             and abs(left.duration_ms - right.duration_ms) <= THRESHOLDS.duration_tolerance_ms
-            and (left.explicit is None or right.explicit is None
-                 or left.explicit == right.explicit))
+            and censorship_features(left).hints == censorship_features(right).hints)
 
 
 class MatchingEngine:
@@ -213,15 +281,20 @@ class MatchingEngine:
     def decide(self, source: Track, candidates: Iterable[Track]) -> Decision:
         unique = {candidate.id: candidate for candidate in candidates if candidate.id and candidate.title}
         ranked = sorted((CandidateEvidence(candidate, metadata_features(source, candidate))
-                         for candidate in unique.values()), key=lambda item: item.features.rank, reverse=True)
+                         for candidate in unique.values()), key=lambda item:
+                        (item.features.rank, censorship_features(item.candidate).uncensored), reverse=True)
         if not ranked:
             return Decision(DecisionKind.NO_CANDIDATE, self.mode, reasons=("catalog_empty",))
         # Jev sees plausible titles even when local scoring penalizes a version or guest artist.
-        plausible = [item for item in ranked if item.features.title_similarity >= THRESHOLDS.min_title_similarity or
-                     "isrc_equal" in item.features.reasons]
+        plausible = [item for item in ranked if not item.features.blocked and
+                     (item.features.title_similarity >= THRESHOLDS.min_title_similarity or
+                      "isrc_equal" in item.features.reasons)]
         if not plausible:
-            return Decision(DecisionKind.REJECT, self.mode, reasons=("no_plausible_title",),
-                            considered=tuple(ranked))
+            best = ranked[0]
+            return Decision(DecisionKind.REJECT, self.mode, best.candidate,
+                            metadata_rank=best.features.rank,
+                            reasons=(*best.features.reasons, "no_eligible_candidate"), considered=tuple(ranked))
+        policy_reasons = ("censored_candidates_excluded",) if any(item.features.blocked for item in ranked) else ()
         if self.verify:
             selected = plausible[:THRESHOLDS.max_jev_candidates]
             if len(selected) == 1:
@@ -234,9 +307,23 @@ class MatchingEngine:
                          for item, probability in zip(selected, probabilities)]
             evaluated.sort(key=lambda item: item.jev_probability, reverse=True)
             best = evaluated[0]
+            preferred = [item for item in evaluated
+                         if not censorship_features(source).hints
+                         and not item.features.conflict
+                         and item.jev_probability >= THRESHOLDS.jev_match
+                         and best.jev_probability >= THRESHOLDS.jev_match
+                         and censorship_features(item.candidate).uncensored
+                         and _equivalent_releases(best.candidate, item.candidate)]
+            uncensored_preferred = bool(preferred) and not censorship_features(best.candidate).uncensored
+            if uncensored_preferred:
+                best = preferred[0]
+                evaluated.remove(best)
+                evaluated.insert(0, best)
             close = [item for item in evaluated[1:]
                      if item.jev_probability >= THRESHOLDS.jev_review
-                     and best.jev_probability - item.jev_probability < THRESHOLDS.jev_margin]
+                     and best.jev_probability - item.jev_probability < THRESHOLDS.jev_margin
+                     and not math.isclose(best.jev_probability - item.jev_probability,
+                                          THRESHOLDS.jev_margin, abs_tol=1e-9)]
             equivalent_releases = bool(close) and all(
                 item.jev_probability >= THRESHOLDS.jev_match
                 and not item.features.conflict
@@ -256,11 +343,17 @@ class MatchingEngine:
                 verdict = "equivalent_release_candidates"
             else:
                 verdict = "jev_evaluated"
-            reasons = (*best.features.reasons, verdict)
+            reasons = (*best.features.reasons, verdict, *policy_reasons,
+                       *(("uncensored_preferred",) if uncensored_preferred else ()))
+            evaluated_ids = {item.candidate.id for item in evaluated}
+            considered = (*evaluated, *(item for item in ranked if item.candidate.id not in evaluated_ids))
             return Decision(kind, self.mode, best.candidate, "jev", best.features.rank,
-                            probability, reasons, tuple(evaluated))
+                            probability, reasons, tuple(considered))
         best = plausible[0]
-        next_rank = plausible[1].features.rank if len(plausible) > 1 else 0.0
+        competitors = [item for item in plausible[1:] if not (
+            best.features.safe_exact and item.features.safe_exact
+            and _equivalent_releases(best.candidate, item.candidate))]
+        next_rank = competitors[0].features.rank if competitors else 0.0
         if best.features.safe_exact and next_rank < best.features.rank - THRESHOLDS.metadata_margin:
             kind = DecisionKind.MATCH
         elif best.features.rank >= THRESHOLDS.metadata_review:
@@ -268,4 +361,4 @@ class MatchingEngine:
         else:
             kind = DecisionKind.REJECT
         return Decision(kind, self.mode, best.candidate, "metadata", best.features.rank,
-                        reasons=best.features.reasons, considered=tuple(ranked))
+                        reasons=(*best.features.reasons, *policy_reasons), considered=tuple(ranked))

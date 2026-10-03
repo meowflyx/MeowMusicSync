@@ -240,6 +240,10 @@ def pending_card(key: str, entry: dict) -> tuple[str, InlineKeyboardMarkup]:
         "jev_rejected": "Jev отверг пару",
         "jev_close_candidates": "несколько близких кандидатов",
         "mapping_conflict": "ID уже связан с другой парой",
+        "censorship_conflict": "несовместимая цензура или clean/radio версия",
+        "uncensored_preferred": "выбрана версия без цензуры",
+        "censored_candidates_excluded": "clean/radio кандидаты исключены",
+        "no_eligible_candidate": "нет подходящей версии",
     }
     details = ", ".join(reason_labels.get(reason, reason) for reason in
                         (entry.get('reasons') or ())) or "нет подробностей"
@@ -248,6 +252,7 @@ def pending_card(key: str, entry: dict) -> tuple[str, InlineKeyboardMarkup]:
         f"{'✅' if item['id'] == entry.get('found_id') else '•'} {index}. "
         f"{item.get('label', item['id'])[:180]}: ранг {item['rank']:.0f}"
         + (f", Jev {item['jev']:.1%}" if item.get('jev') is not None else "")
+        + (", ⛔ несовместимая цензура/версия" if "censorship_conflict" in item.get('reasons', []) else "")
         for index, item in enumerate(choices, 1)
     )
     text = (

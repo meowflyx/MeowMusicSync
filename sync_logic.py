@@ -693,6 +693,8 @@ def check_duplicate(track1: dict, track2: dict) -> bool:
     """Conservative duplicate check using the same recording features as sync."""
     left = _as_track("local", {"id": track1.get("id", "1"), **track1})
     right = _as_track("local", {"id": track2.get("id", "2"), **track2})
+    if left.explicit is not None and right.explicit is not None and left.explicit != right.explicit:
+        return False
     return metadata_features(left, right).safe_exact
 
 

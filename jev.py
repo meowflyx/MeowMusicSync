@@ -8,7 +8,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from cryptography.fernet import Fernet, InvalidToken
-from matching import FEATURED, Track, title_features
+from matching import FEATURED, Track, censorship_features, title_features
 
 
 KEY_FILE = ".jev.key"
@@ -49,11 +49,13 @@ def decrypt_key(ciphertext):
 
 def _record(track: Track) -> dict:
     base_title, markers = title_features(track)
+    censorship = censorship_features(track)
     return {"platform": track.platform, "id": track.id, "title": track.title,
             "artists": track.artists, "album": track.album,
             "duration_ms": track.duration_ms, "isrc": track.isrc,
             "explicit": track.explicit, "version": track.version,
             "base_title": base_title, "version_markers": sorted(markers),
+            "censorship_hints": censorship.hints, "uncensored_evidence": censorship.uncensored,
             "featured_artists": [match.group(1) for match in FEATURED.finditer(track.title)]}
 
 
@@ -79,7 +81,14 @@ def match_probability(provider: str, api_key: str, yandex: Track, spotify: Track
                 "instrumental, slowed, sped-up, demo, or rerecording is a different version. "
                 "Version clues can occur in the track title, version field, or album title; "
                 "compare them. Compare ISRCs when both are supplied. Missing fields are unknown, "
-                "not mismatches."
+                "not mismatches. A clean, censored, bleeped, edited, family-friendly, radio or TV "
+                "edit is not equivalent to its uncensored/explicit recording, even with similar "
+                "duration or shared ISRC. A masked title (e.g. ***** Please II) is a censorship "
+                "clue; consider the explicit flags and other metadata. Explicit, uncensored, "
+                "dirty or unedited labels describe the uncut recording, not a remix. "
+                "uncensored_evidence=false means no positive uncensored clue, not proof of a clean edit. "
+                "explicit=false alone does not prove censorship: many originals contain no "
+                "explicit lyrics. Preserve a clean source's version; do not upgrade it to explicit."
             ),
         }},
     }

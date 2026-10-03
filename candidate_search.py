@@ -32,10 +32,13 @@ def yandex_track(item, *, original: bool = False) -> Track:
     title = selected.title or ""
     if version and normalize(version) not in normalize(title):
         title = f"{title} ({version})"
+    explicit = getattr(selected, "explicit", None)
+    if getattr(selected, "content_warning", None) == "explicit":
+        explicit = True
     return Track("yandex", str(item.id), title,
                  tuple(artist.name for artist in selected.artists or []),
                  getattr(album, "title", None), getattr(selected, "duration_ms", None) or None,
-                 getattr(selected, "isrc", None), getattr(selected, "explicit", None), version)
+                 getattr(selected, "isrc", None), explicit, version)
 
 
 def _existing_pool(source: Track, existing: Iterable[Track]) -> dict[str, Track]:

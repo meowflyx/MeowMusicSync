@@ -54,6 +54,8 @@ class JevTests(unittest.TestCase):
                     self.assertEqual(body["questions"]["same_track"]["type"], question_type)
                     self.assertEqual(body["state"]["yandex"]["title"], "Song")
                     self.assertEqual(body["state"]["yandex"]["duration_ms"], 180000)
+                    self.assertIn("censorship_hints", body["state"]["yandex"])
+                    self.assertIn("explicit=false alone", body["questions"]["same_track"]["instructions"])
                     self.assertIn("album name alone", body["questions"]["same_track"]["instructions"])
                     self.assertIn("count each person once", body["questions"]["same_track"]["instructions"])
                     return self._response({"answers": {"same_track": {answer_field: .97}}})
@@ -133,6 +135,71 @@ class JevTests(unittest.TestCase):
         with closing(sqlite3.connect(sync.DB_FILE)) as db:
             self.assertEqual(db.execute("SELECT status, provenance FROM mappings").fetchone(),
                              ("active", "manual_review"))
+
+    def test_old_pending_retries_with_censorship_policy_in_both_directions(self):
+        sync.configure_jev("openrouter", "test-private-key")
+        sync.set_matching_mode("jev_only")
+        for direction in ("ym_to_sp", "sp_to_ym"):
+            with self.subTest(direction=direction):
+                with closing(sqlite3.connect(sync.DB_FILE)) as db, db:
+                    db.execute("DELETE FROM mappings")
+                    db.execute("DELETE FROM pending_syncs")
+                    db.execute("INSERT INTO pending_syncs (key,algorithm_version,mode) VALUES (?,3,'jev_only')",
+                               (f"{direction}:source",))
+                row = {"id": "source", "title": "Song", "artists": "Artist", "explicit": True,
+                       "duration_ms": 180000}
+                platform = "spotify" if direction == "ym_to_sp" else "yandex"
+                candidates = [Track(platform, "clean", "Song (Clean)", ("Artist",), duration_ms=180000),
+                              Track(platform, "original", "Song", ("Artist",), duration_ms=180000,
+                                    explicit=True)]
+                added = []
+                client = type("Client", (), {
+                    "current_user_saved_tracks_add": lambda self, **kw: added.append(kw),
+                    "users_likes_tracks_add": lambda self, **kw: added.append(kw)})()
+                yandex_rows, spotify_rows = ([row], []) if direction == "ym_to_sp" else ([], [row])
+                discover_name = "discover_spotify" if direction == "ym_to_sp" else "discover_yandex"
+                with patch.object(sync, "get_ym_client", return_value=client), \
+                     patch.object(sync, "get_sp_client", return_value=client), \
+                     patch.object(sync, "get_ym_likes", return_value=yandex_rows), \
+                     patch.object(sync, "get_sp_likes", return_value=spotify_rows), \
+                     patch.object(sync, discover_name, return_value=candidates), \
+                     patch.object(jev, "match_probability", return_value=.95) as verify:
+                    self.assertIn("добавлено 1", sync._sync_direction(direction))
+                self.assertEqual(verify.call_count, 1)
+                self.assertEqual(added, [{"tracks" if direction == "ym_to_sp" else "track_ids": ["original"]}])
+                self.assertEqual(sync.get_pending_tracks(), {})
+
+    def test_clean_only_result_is_failed_instead_of_pending_or_added(self):
+        sync.configure_jev("openrouter", "test-private-key")
+        sync.set_matching_mode("jev_only")
+        source = {"id": "source", "title": "Song", "artists": "Artist", "duration_ms": 180000}
+        target = Track("yandex", "clean", "Song (Radio Edit)", ("Artist",), duration_ms=180000)
+        with patch.object(sync, "get_ym_client", return_value=object()), \
+             patch.object(sync, "get_sp_client", return_value=object()), \
+             patch.object(sync, "get_ym_likes", return_value=[]), \
+             patch.object(sync, "get_sp_likes", return_value=[source]), \
+             patch.object(sync, "discover_yandex", return_value=[target]), \
+             patch.object(jev, "match_probability", side_effect=AssertionError("must prefilter clean")):
+            self.assertIn("не найдено 1", sync.sync_sp_to_ym())
+        self.assertEqual(sync.get_pending_tracks(), {})
+        self.assertIn("sp_to_ym:source", sync.get_failed_tracks())
+
+    def test_censored_library_result_does_not_bypass_catalog_search(self):
+        source = {"id": "source", "title": "Song", "artists": "Artist", "duration_ms": 180000,
+                  "explicit": True}
+        clean = {"id": "clean", "title": "Song", "artists": "Artist", "duration_ms": 180000,
+                 "explicit": False}
+        original = Track("spotify", "original", "Song", ("Artist",), duration_ms=180000, explicit=True)
+        added = []
+        client = type("SP", (), {"current_user_saved_tracks_add": lambda self, **kw: added.append(kw)})()
+        with patch.object(sync, "get_ym_client", return_value=object()), \
+             patch.object(sync, "get_sp_client", return_value=client), \
+             patch.object(sync, "get_ym_likes", return_value=[source]), \
+             patch.object(sync, "get_sp_likes", return_value=[clean]), \
+             patch.object(sync, "discover_spotify", return_value=[original]) as discover:
+            self.assertIn("добавлено 1", sync.sync_ym_to_sp())
+        discover.assert_called_once()
+        self.assertEqual(added, [{"tracks": ["original"]}])
 
     def test_reverse_direction_uses_same_engine(self):
         source = {"id": "sp1", "artists": "Artist", "title": "Song",

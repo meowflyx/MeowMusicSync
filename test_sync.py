@@ -74,6 +74,12 @@ class SyncRegressionTests(unittest.TestCase):
         self.assertFalse(sync.check_duplicate({"artists": "", "title": ""},
                                               {"artists": "", "title": ""}))
 
+    def test_duplicate_removal_keeps_clean_and_explicit_recordings(self):
+        left = {"title": "Song", "artists": "Artist", "duration_ms": 180000, "explicit": True}
+        right = {**left, "explicit": False}
+        self.assertFalse(sync.check_duplicate(left, right))
+        self.assertFalse(sync.check_duplicate(right, left))
+
     def test_clear_returns_deleted_count(self):
         with closing(sqlite3.connect(sync.DB_FILE)) as db, db:
             db.execute("INSERT INTO failed_syncs (key, query) VALUES ('x', 'song')")
